@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
+from typing import Optional
 from backend.config import settings
 from backend.models import (
     JiraSessionState,
@@ -85,12 +86,25 @@ async def jira_connect_pat(
     return await connect_via_pat(session_id=session_id, req=req)
 
 
-@app.get("/jira/tickets")
-async def list_recent_tickets(session_id: str = Query(default="default-engineer-session")):
-    """Fetches recent tickets across all permitted projects from the connected Jira workspace."""
+@app.get("/jira/projects")
+async def list_jira_projects(session_id: str = Query(default="default-engineer-session")):
+    """Fetches list of projects available in the connected Jira workspace."""
     session = get_or_create_session(session_id)
     service = JiraClientService(session)
-    return await service.fetch_recent_tickets(max_results=50)
+    return await service.fetch_projects()
+
+
+@app.get("/jira/tickets")
+async def list_recent_tickets(
+    start_at: int = Query(default=0, ge=0),
+    max_results: int = Query(default=10, ge=1, le=50),
+    project_key: Optional[str] = Query(default=None),
+    session_id: str = Query(default="default-engineer-session")
+):
+    """Fetches paginated and project-filtered tickets from the connected Jira workspace."""
+    session = get_or_create_session(session_id)
+    service = JiraClientService(session)
+    return await service.fetch_recent_tickets(start_at=start_at, max_results=max_results, project_key=project_key)
 
 
 @app.post("/agent/investigate", response_model=InvestigationReport)

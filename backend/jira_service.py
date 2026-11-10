@@ -42,23 +42,43 @@ class JiraClientService:
             auth = (self.session.email or "", self.session.access_token or "")
         return base_url, headers, auth
 
-    async def fetch_recent_tickets(self, max_results: int = 50) -> List[Dict[str, str]]:
-        """Queries Atlassian's /rest/api/3/search/jql endpoint with a valid bounded JQL query."""
+    async def fetch_projects(self) -> List[Dict[str, str]]:
+        """Fetches all projects available in the connected Jira workspace."""
         base_url, headers, auth = self._get_base_url_and_auth()
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            request_kwargs: Dict[str, Any] = {"headers": headers}
+            if auth is not None:
+                request_kwargs["auth"] = auth
+
+            resp = await client.get(f"{base_url}/project", **request_kwargs)
+            if resp.status_code != 200:
+                return []
+            
+            projects_data = resp.json()
+            return [{"key": p.get("key"), "name": p.get("name")} for p in projects_data if p.get("key")]
+
+    async def fetch_recent_tickets(self, start_at: int = 0, max_results: int = 50, project_key: Optional[str] = None) -> Dict[str, Any]:
+        """Queries Atlassian's GET /rest/api/3/search/jql endpoint with explicit project fields."""
+        base_url, headers, auth = self._get_base_url_and_auth()
+        
+        if project_key and project_key != "ALL":
+            jql_query = f'project = "{project_key}" ORDER BY created DESC'
+        else:
+            jql_query = "project is not EMPTY ORDER BY created DESC"
+
         async with httpx.AsyncClient(timeout=25.0) as client:
             request_kwargs: Dict[str, Any] = {
-                "json": {
-                    # Valid bounded JQL query that matches all workspace tickets
-                    "jql": "project is not EMPTY ORDER BY created DESC",
+                "params": {
+                    "jql": jql_query,
                     "maxResults": max_results,
-                    "fields": ["summary", "status", "priority", "issuetype", "created"],
+                    "fields": "summary,status,priority,issuetype,created,project",
                 },
                 "headers": headers,
             }
             if auth is not None:
                 request_kwargs["auth"] = auth
 
-            resp = await client.post(f"{base_url}/search/jql", **request_kwargs)
+            resp = await client.get(f"{base_url}/search/jql", **request_kwargs)
             if resp.status_code != 200:
                 raise HTTPException(
                     status_code=resp.status_code,
@@ -67,17 +87,21 @@ class JiraClientService:
 
             data = resp.json()
             issues = data.get("issues", [])
+            total_count = data.get("total", len(issues))
             results = []
             for issue in issues:
                 f = issue.get("fields", {})
+                proj = f.get("project", {}) or {}
                 results.append({
                     "key": issue.get("key"),
+                    "project_key": proj.get("key", "UNKNOWN"),
+                    "project_name": proj.get("name", "Unknown Project"),
                     "summary": f.get("summary", "No summary"),
                     "status": (f.get("status") or {}).get("name", "Unknown"),
                     "priority": (f.get("priority") or {}).get("name", "Medium"),
                     "type": (f.get("issuetype") or {}).get("name", "Task"),
                 })
-            return results
+            return {"issues": results, "total": total_count}
 
     async def fetch_ticket_details(self, ticket_key: str) -> JiraTicketData:
         """Fetches full issue details, comments, and attachments for agentic analysis."""
