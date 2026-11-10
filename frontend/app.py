@@ -1,5 +1,6 @@
 import streamlit as st
 import httpx
+import math
 
 BACKEND_URL = "http://localhost:8000"
 SESSION_ID = "default-engineer-session"
@@ -40,6 +41,26 @@ def fetch_connection_status():
     return None
 
 
+# ---------------- CALLBACKS FOR SINGLE-RUN STATE UPDATES ----------------
+def go_prev_page():
+    if st.session_state.get("current_page", 1) > 1:
+        st.session_state["current_page"] -= 1
+
+
+def go_next_page():
+    st.session_state["current_page"] = st.session_state.get("current_page", 1) + 1
+
+
+def trigger_refresh():
+    st.session_state.pop("workspace_projects", None)
+    st.session_state.pop("tickets_cache", None)
+    st.session_state["current_page"] = 1
+
+
+def on_project_filter_change():
+    st.session_state["current_page"] = 1
+
+
 status_data = fetch_connection_status()
 
 if "trigger_toast" in st.session_state:
@@ -53,36 +74,42 @@ with st.sidebar:
 
     if status_data and status_data.get("connected"):
         st.success(f"🟢 Jira Connected ({status_data.get('auth_mode').upper()})")
-        
+
         available_sites = status_data.get("available_sites", [])
         if available_sites and len(available_sites) > 1:
             site_options = {s["name"]: s["id"] for s in available_sites}
             current_site_name = status_data.get("site_name")
-            
+
             selected_site_name = st.selectbox(
                 "Switch Jira Workspace Site",
                 options=list(site_options.keys()),
                 index=list(site_options.keys()).index(current_site_name) if current_site_name in site_options else 0
             )
-            
+
             selected_site_id = site_options[selected_site_name]
             if selected_site_id != status_data.get("cloud_id"):
                 with st.spinner("Switching workspace site..."):
-                    httpx.post(f"{BACKEND_URL}/auth/jira/switch-site", params={"site_id": selected_site_id, "session_id": SESSION_ID}, timeout=5.0)
-                    st.session_state.pop("recent_tickets", None)
-                    st.session_state.pop("ticket_limit", None)
+                    httpx.post(
+                        f"{BACKEND_URL}/auth/jira/switch-site",
+                        params={"site_id": selected_site_id, "session_id": SESSION_ID},
+                        timeout=5.0,
+                    )
+                    st.session_state.pop("workspace_projects", None)
+                    st.session_state.pop("tickets_cache", None)
+                    st.session_state["current_page"] = 1
                     st.toast(f"Switched to workspace: {selected_site_name}", icon="🔄")
                     st.rerun()
 
         st.write(f"**Workspace:** {status_data.get('site_name')}")
         st.write(f"**Site URL:** `{status_data.get('site_url')}`")
-        
+
         st.write("")
         if st.button("🔌 Disconnect Jira", type="secondary", use_container_width=True):
             with st.spinner("Disconnecting..."):
                 httpx.post(f"{BACKEND_URL}/auth/jira/disconnect", params={"session_id": SESSION_ID}, timeout=5.0)
-                st.session_state.pop("recent_tickets", None)
-                st.session_state.pop("ticket_limit", None)
+                st.session_state.pop("workspace_projects", None)
+                st.session_state.pop("tickets_cache", None)
+                st.session_state["current_page"] = 1
                 st.toast("Successfully disconnected from Jira.", icon="🔌")
                 st.rerun()
     else:
@@ -93,7 +120,7 @@ with st.sidebar:
         with auth_tab1:
             st.markdown("Authenticate securely with Atlassian in this tab.")
             oauth_login_url = f"{BACKEND_URL}/auth/jira/login?session_id={SESSION_ID}"
-            
+
             st.markdown(f"""
                 <div style="text-align: center; margin-top: 10px;">
                     <a href="{oauth_login_url}" target="_self" style="display: block; width: 100%; background-color: #0052CC; color: white; padding: 10px 15px; text-decoration: none; border-radius: 4px; font-weight: bold; font-size: 14px; box-sizing: border-box;">
@@ -117,8 +144,9 @@ with st.sidebar:
                             timeout=15.0,
                         )
                         if resp.status_code == 200:
-                            st.session_state.pop("recent_tickets", None)
-                            st.session_state.pop("ticket_limit", None)
+                            st.session_state.pop("workspace_projects", None)
+                            st.session_state.pop("tickets_cache", None)
+                            st.session_state["current_page"] = 1
                             st.toast("Successfully connected to Jira via API Token!", icon="🎉")
                             st.rerun()
                         else:
@@ -134,8 +162,12 @@ with st.sidebar:
 if not status_data or not status_data.get("connected"):
     st.info("👈 Connect your Jira account in the left sidebar to browse live tickets and launch diagnostics.")
 else:
-    if "ticket_limit" not in st.session_state:
-        st.session_state["ticket_limit"] = 10
+    if "current_page" not in st.session_state:
+        st.session_state["current_page"] = 1
+    if "tickets_cache" not in st.session_state:
+        st.session_state["tickets_cache"] = {}
+
+    page_size = 10
 
     if "workspace_projects" not in st.session_state:
         try:
@@ -149,62 +181,88 @@ else:
 
     with st.expander("📋 Browse Recent Tickets from Connected Jira Workspace", expanded=True):
         col_ctrl1, col_ctrl2 = st.columns([4, 1])
-        
+
         projects = st.session_state.get("workspace_projects", [])
-        
+
         proj_options = {"All Projects": "ALL"}
         for p in projects:
-            proj_options[f"{p['name']} ({p['key']})"] = p['key']
-        
+            proj_options[f"{p['name']} ({p['key']})"] = p["key"]
+
         with col_ctrl1:
-            selected_proj_label = st.selectbox("Filter by Project / Board", options=list(proj_options.keys()))
+            selected_proj_label = st.selectbox(
+                "Filter by Project / Board",
+                options=list(proj_options.keys()),
+                key="project_filter_select",
+                on_change=on_project_filter_change,
+            )
             selected_proj_key = proj_options[selected_proj_label]
 
         with col_ctrl2:
             st.write("")
             st.write("")
-            if st.button("🔄 Refresh"):
-                with st.spinner("Refreshing tickets..."):
-                    st.session_state.pop("recent_tickets", None)
-                    st.session_state["ticket_limit"] = 10
-                    st.session_state.pop("workspace_projects", None)
-                st.rerun()
+            st.button("🔄 Refresh", on_click=trigger_refresh, use_container_width=True)
 
-        # Fetch tickets dynamically based on the selected project key and pagination limit
-        with st.spinner("Fetching tickets from Jira workspace..."):
-            try:
-                resp = httpx.get(
-                    f"{BACKEND_URL}/jira/tickets",
-                    params={
-                        "start_at": 0,
-                        "max_results": st.session_state["ticket_limit"],
-                        "project_key": selected_proj_key,
-                        "session_id": SESSION_ID
-                    },
-                    timeout=25.0
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    filtered_tickets = data.get("issues", [])
-                    total_available = data.get("total", len(filtered_tickets))
-                else:
-                    st.error(f"Error loading tickets: {resp.text}")
-                    filtered_tickets = []
-                    total_available = 0
-            except Exception as e:
-                st.error(f"Connection error: {e}")
-                filtered_tickets = []
-                total_available = 0
+        current_page = st.session_state["current_page"]
+        start_at = (current_page - 1) * page_size
+        cache_key = f"{status_data.get('cloud_id')}_{selected_proj_key}_{current_page}"
+
+        # Only call the backend once per unique (site, project, page) view
+        if cache_key not in st.session_state["tickets_cache"]:
+            with st.spinner("Fetching tickets from Jira workspace..."):
+                try:
+                    resp = httpx.get(
+                        f"{BACKEND_URL}/jira/tickets",
+                        params={
+                            "start_at": start_at,
+                            "max_results": page_size,
+                            "project_key": selected_proj_key,
+                            "session_id": SESSION_ID,
+                        },
+                        timeout=25.0,
+                    )
+                    if resp.status_code == 200:
+                        st.session_state["tickets_cache"][cache_key] = resp.json()
+                    else:
+                        st.error(f"Error loading tickets: {resp.text}")
+                        st.session_state["tickets_cache"][cache_key] = {"issues": [], "total": 0}
+                except Exception as e:
+                    st.error(f"Connection error: {e}")
+                    st.session_state["tickets_cache"][cache_key] = {"issues": [], "total": 0}
+
+        cached_data = st.session_state["tickets_cache"].get(cache_key, {"issues": [], "total": 0})
+        filtered_tickets = cached_data.get("issues", [])
+        total_available = cached_data.get("total", len(filtered_tickets))
+        total_pages = max(1, math.ceil(total_available / page_size))
 
         if filtered_tickets:
             st.dataframe(filtered_tickets, use_container_width=True)
-            
-            if len(filtered_tickets) < total_available:
-                if st.button("⬇️ Load 10 More Tasks", use_container_width=True):
-                    st.session_state["ticket_limit"] += 10
-                    st.rerun()
+
+            first_item_num = start_at + 1
+            last_item_num = start_at + len(filtered_tickets)
+
+            if total_pages > 1:
+                col_p1, col_p2, col_p3 = st.columns([1, 2, 1])
+                with col_p1:
+                    if current_page > 1:
+                        st.button("⬅️ Previous Page", on_click=go_prev_page, use_container_width=True)
+                with col_p2:
+                    st.markdown(
+                        f"<div style='text-align: center; padding-top: 6px;'>"
+                        f"Page <b>{current_page}</b> of <b>{total_pages}</b> "
+                        f"(Showing {first_item_num}–{last_item_num} of {total_available} tasks)"
+                        f"</div>",
+                        unsafe_allow_html=True,
+                    )
+                with col_p3:
+                    if current_page < total_pages:
+                        st.button("Next Page ➡️", on_click=go_next_page, use_container_width=True)
             else:
-                st.caption(f"Showing all {len(filtered_tickets)} tasks for this view.")
+                st.markdown(
+                    f"<div style='text-align: center; color: gray; padding-top: 5px;'>"
+                    f"Showing all {total_available} tasks for this view."
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
         else:
             st.warning("No tickets found matching the selected project filter.")
 
