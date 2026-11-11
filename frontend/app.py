@@ -1,15 +1,26 @@
 import streamlit as st
 import httpx
-import math
 
 BACKEND_URL = "http://localhost:8000"
 SESSION_ID = "default-engineer-session"
 
 st.set_page_config(
-    page_title="Agentic Ops | Production Troubleshooter",
-    page_icon="🛠️",
+    page_title="Agentic Ops | Autonomous Production Troubleshooter",
+    page_icon="🤖",
     layout="wide",
 )
+
+st.markdown("""
+    <style>
+        h1, h2, h3, h4 {
+            font-family: 'Inter', sans-serif;
+        }
+        .stButton>button {
+            border-radius: 6px;
+            font-weight: 600;
+        }
+    </style>
+""", unsafe_allow_html=True)
 
 st.markdown("""
     <script>
@@ -24,11 +35,8 @@ query_params = st.query_params
 if "action" in query_params:
     action_val = query_params["action"]
     if action_val == "connected":
-        st.session_state["trigger_toast"] = ("Successfully connected to Jira!", "🎉")
+        st.session_state["trigger_toast"] = ("Successfully connected to Jira workspace via OAuth!", "🎉")
     st.query_params.clear()
-
-st.title("🛠️ Autonomous Production Incident Troubleshooter")
-st.caption("Stage 1: Jira REST v3 Connector + Agentic StateGraph Diagnostic Orchestrator")
 
 
 def fetch_connection_status():
@@ -41,102 +49,69 @@ def fetch_connection_status():
     return None
 
 
-# ---------------- CALLBACKS FOR SINGLE-RUN STATE UPDATES ----------------
-def go_prev_page():
-    if st.session_state.get("current_page", 1) > 1:
-        st.session_state["current_page"] -= 1
-
-
-def go_next_page():
-    st.session_state["current_page"] = st.session_state.get("current_page", 1) + 1
-
-
-def trigger_refresh():
-    st.session_state.pop("workspace_projects", None)
-    st.session_state.pop("tickets_cache", None)
-    st.session_state["current_page"] = 1
-
-
-def on_project_filter_change():
-    st.session_state["current_page"] = 1
+def fetch_cloud_status():
+    try:
+        r = httpx.get(f"{BACKEND_URL}/cloud/status", params={"session_id": SESSION_ID}, timeout=5.0)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        return None
+    return None
 
 
 status_data = fetch_connection_status()
+cloud_status = fetch_cloud_status()
 
 if "trigger_toast" in st.session_state:
     msg, icon = st.session_state["trigger_toast"]
     st.toast(msg, icon=icon)
     del st.session_state["trigger_toast"]
 
-# ---------------- SIDEBAR: TOOL INTEGRATIONS ----------------
+if "messages" not in st.session_state:
+    st.session_state["messages"] = [
+        {
+            "role": "assistant",
+            "content": "👋 **Hello Engineer!** I am your **Autonomous AI Reliability Engineer**. Connect your workspace in the sidebar, then type a request (e.g., *'Explain KAN-1'*, *'Give me full details of KAN-1'*, *'How many tasks are there total'*, or *'Investigate KAN-1'*) to query your board.",
+        }
+    ]
+
+# ---------------- SIDEBAR: PROFESSIONAL NAVIGATION & CREDENTIALS ----------------
 with st.sidebar:
-    st.header("🔌 Tool Integrations")
+    st.markdown("### ⚡ Agentic Ops Hub")
+    st.caption("Enterprise Autonomous Reliability Platform")
+    st.divider()
 
+    # --- JIRA CONNECTION ---
+    st.markdown("#### 📋 Issue Tracker Integration")
     if status_data and status_data.get("connected"):
-        st.success(f"🟢 Jira Connected ({status_data.get('auth_mode').upper()})")
-
-        available_sites = status_data.get("available_sites", [])
-        if available_sites and len(available_sites) > 1:
-            site_options = {s["name"]: s["id"] for s in available_sites}
-            current_site_name = status_data.get("site_name")
-
-            selected_site_name = st.selectbox(
-                "Switch Jira Workspace Site",
-                options=list(site_options.keys()),
-                index=list(site_options.keys()).index(current_site_name) if current_site_name in site_options else 0
-            )
-
-            selected_site_id = site_options[selected_site_name]
-            if selected_site_id != status_data.get("cloud_id"):
-                with st.spinner("Switching workspace site..."):
-                    httpx.post(
-                        f"{BACKEND_URL}/auth/jira/switch-site",
-                        params={"site_id": selected_site_id, "session_id": SESSION_ID},
-                        timeout=5.0,
-                    )
-                    st.session_state.pop("workspace_projects", None)
-                    st.session_state.pop("tickets_cache", None)
-                    st.session_state["current_page"] = 1
-                    st.toast(f"Switched to workspace: {selected_site_name}", icon="🔄")
-                    st.rerun()
-
-        st.write(f"**Workspace:** {status_data.get('site_name')}")
-        st.write(f"**Site URL:** `{status_data.get('site_url')}`")
-
-        st.write("")
-        if st.button("🔌 Disconnect Jira", type="secondary", use_container_width=True):
-            with st.spinner("Disconnecting..."):
-                httpx.post(f"{BACKEND_URL}/auth/jira/disconnect", params={"session_id": SESSION_ID}, timeout=5.0)
-                st.session_state.pop("workspace_projects", None)
-                st.session_state.pop("tickets_cache", None)
-                st.session_state["current_page"] = 1
-                st.toast("Successfully disconnected from Jira.", icon="🔌")
-                st.rerun()
+        st.success("🟢 Connected")
+        st.caption(f"Workspace: `{status_data.get('site_name')}`")
+        if st.button("Disconnect Workspace", type="secondary", use_container_width=True):
+            httpx.post(f"{BACKEND_URL}/auth/jira/disconnect", params={"session_id": SESSION_ID}, timeout=5.0)
+            st.toast("Disconnected.", icon="🔌")
+            st.rerun()
     else:
-        st.warning("🔴 Jira Not Connected")
-
-        auth_tab1, auth_tab2 = st.tabs(["🔐 OAuth 2.0 (3LO)", "🔑 API Token (Fast Test)"])
-
-        with auth_tab1:
-            st.markdown("Authenticate securely with Atlassian in this tab.")
+        st.warning("🔴 Disconnected")
+        jira_tab1, jira_tab2 = st.tabs(["🔐 OAuth 2.0", "🔑 API Token"])
+        
+        with jira_tab1:
             oauth_login_url = f"{BACKEND_URL}/auth/jira/login?session_id={SESSION_ID}"
-
             st.markdown(f"""
-                <div style="text-align: center; margin-top: 10px;">
-                    <a href="{oauth_login_url}" target="_self" style="display: block; width: 100%; background-color: #0052CC; color: white; padding: 10px 15px; text-decoration: none; border-radius: 4px; font-weight: bold; font-size: 14px; box-sizing: border-box;">
-                        🚀 Sign in with Atlassian (OAuth 2.0)
+                <div style="text-align: center; margin-top: 8px; margin-bottom: 8px;">
+                    <a href="{oauth_login_url}" target="_self" style="display: block; width: 100%; background-color: #0052CC; color: white; padding: 9px 12px; text-decoration: none; border-radius: 6px; font-weight: bold; font-size: 13px; box-sizing: border-box;">
+                        🚀 Sign in with Atlassian
                     </a>
                 </div>
             """, unsafe_allow_html=True)
-
-        with auth_tab2:
-            with st.form("pat_form"):
-                site_url = st.text_input("Jira Workspace URL", placeholder="https://your-domain.atlassian.net")
-                email = st.text_input("Atlassian Email", placeholder="you@company.com")
+            
+        with jira_tab2:
+            with st.form("pat_auth_form"):
+                site_url = st.text_input("Workspace URL", placeholder="https://domain.atlassian.net")
+                email = st.text_input("Email", placeholder="you@company.com")
                 api_token = st.text_input("API Token", type="password")
-                submitted = st.form_submit_button("Connect Workspace", use_container_width=True)
-                if submitted:
-                    with st.spinner("Verifying credentials with Jira..."):
+                submitted_pat = st.form_submit_button("Connect via Token", use_container_width=True)
+                if submitted_pat:
+                    with st.spinner("Connecting..."):
                         resp = httpx.post(
                             f"{BACKEND_URL}/auth/jira/connect-pat",
                             params={"session_id": SESSION_ID},
@@ -144,187 +119,156 @@ with st.sidebar:
                             timeout=15.0,
                         )
                         if resp.status_code == 200:
-                            st.session_state.pop("workspace_projects", None)
-                            st.session_state.pop("tickets_cache", None)
-                            st.session_state["current_page"] = 1
-                            st.toast("Successfully connected to Jira via API Token!", icon="🎉")
+                            st.toast("Connected successfully!", icon="🎉")
                             st.rerun()
                         else:
-                            st.error(f"Connection failed: {resp.text}")
+                            st.error(f"Failed: {resp.text}")
 
     st.divider()
-    st.subheader("☁️ Upcoming Stage 2 Connectors")
-    st.checkbox("Azure Monitor / App Insights (Stage 2)", value=False, disabled=True)
-    st.checkbox("AWS CloudWatch / Lambda Logs (Stage 2)", value=False, disabled=True)
-    st.checkbox("Visual Studio Codebase Vector DB (Stage 3)", value=False, disabled=True)
 
-# ---------------- MAIN WORKSPACE ----------------
-if not status_data or not status_data.get("connected"):
-    st.info("👈 Connect your Jira account in the left sidebar to browse live tickets and launch diagnostics.")
-else:
-    if "current_page" not in st.session_state:
-        st.session_state["current_page"] = 1
-    if "tickets_cache" not in st.session_state:
-        st.session_state["tickets_cache"] = {}
+    # --- CLOUD TELEMETRY CONNECTION ---
+    st.markdown("#### ☁️ Cloud Telemetry")
+    if cloud_status and cloud_status.get("connected"):
+        mode_label = "SANDBOX" if cloud_status.get("is_sandbox") else "LIVE"
+        st.success(f"🟢 {cloud_status.get('provider')} Connected ({mode_label})")
+        if st.button("Disconnect Cloud", type="secondary", use_container_width=True):
+            httpx.post(f"{BACKEND_URL}/cloud/disconnect", params={"session_id": SESSION_ID}, timeout=5.0)
+            st.toast("Disconnected Cloud Provider.", icon="🔌")
+            st.rerun()
+    else:
+        st.warning("🔴 Cloud Unconnected")
+        chosen_provider = st.radio("Platform", ["Azure Monitor", "AWS CloudWatch"], horizontal=True)
+        use_sandbox = st.checkbox("🧪 Use Sandbox Mode", value=False)
 
-    page_size = 10
-
-    if "workspace_projects" not in st.session_state:
-        try:
-            p_resp = httpx.get(f"{BACKEND_URL}/jira/projects", params={"session_id": SESSION_ID}, timeout=10.0)
-            if p_resp.status_code == 200:
-                st.session_state["workspace_projects"] = p_resp.json()
-            else:
-                st.session_state["workspace_projects"] = []
-        except Exception:
-            st.session_state["workspace_projects"] = []
-
-    with st.expander("📋 Browse Recent Tickets from Connected Jira Workspace", expanded=True):
-        col_ctrl1, col_ctrl2 = st.columns([4, 1])
-
-        projects = st.session_state.get("workspace_projects", [])
-
-        proj_options = {"All Projects": "ALL"}
-        for p in projects:
-            proj_options[f"{p['name']} ({p['key']})"] = p["key"]
-
-        with col_ctrl1:
-            selected_proj_label = st.selectbox(
-                "Filter by Project / Board",
-                options=list(proj_options.keys()),
-                key="project_filter_select",
-                on_change=on_project_filter_change,
-            )
-            selected_proj_key = proj_options[selected_proj_label]
-
-        with col_ctrl2:
-            st.write("")
-            st.write("")
-            st.button("🔄 Refresh", on_click=trigger_refresh, use_container_width=True)
-
-        current_page = st.session_state["current_page"]
-        start_at = (current_page - 1) * page_size
-        cache_key = f"{status_data.get('cloud_id')}_{selected_proj_key}_{current_page}"
-
-        # Only call the backend once per unique (site, project, page) view
-        if cache_key not in st.session_state["tickets_cache"]:
-            with st.spinner("Fetching tickets from Jira workspace..."):
-                try:
-                    resp = httpx.get(
-                        f"{BACKEND_URL}/jira/tickets",
-                        params={
-                            "start_at": start_at,
-                            "max_results": page_size,
-                            "project_key": selected_proj_key,
-                            "session_id": SESSION_ID,
-                        },
-                        timeout=25.0,
-                    )
+        if use_sandbox:
+            if st.button("🚀 Connect Sandbox Environment", use_container_width=True, type="primary"):
+                with st.spinner("Initializing sandbox telemetry..."):
+                    endpoint = "azure" if "Azure" in chosen_provider else "aws"
+                    payload = {
+                        "tenant_id": "sandbox-tenant", "client_id": "sandbox-client",
+                        "client_secret": "sandbox-secret", "subscription_id": "sub-prod-india-01", "use_sandbox": True
+                    } if endpoint == "azure" else {
+                        "access_key_id": "sandbox-key", "secret_access_key": "sandbox-secret",
+                        "region": "ap-south-1", "use_sandbox": True
+                    }
+                    resp = httpx.post(f"{BACKEND_URL}/cloud/connect/{endpoint}", params={"session_id": SESSION_ID}, json=payload, timeout=10.0)
                     if resp.status_code == 200:
-                        st.session_state["tickets_cache"][cache_key] = resp.json()
+                        st.toast("Sandbox connected successfully!", icon="☁️")
+                        st.rerun()
                     else:
-                        st.error(f"Error loading tickets: {resp.text}")
-                        st.session_state["tickets_cache"][cache_key] = {"issues": [], "total": 0}
-                except Exception as e:
-                    st.error(f"Connection error: {e}")
-                    st.session_state["tickets_cache"][cache_key] = {"issues": [], "total": 0}
-
-        cached_data = st.session_state["tickets_cache"].get(cache_key, {"issues": [], "total": 0})
-        filtered_tickets = cached_data.get("issues", [])
-        total_available = cached_data.get("total", len(filtered_tickets))
-        total_pages = max(1, math.ceil(total_available / page_size))
-
-        if filtered_tickets:
-            st.dataframe(filtered_tickets, use_container_width=True)
-
-            first_item_num = start_at + 1
-            last_item_num = start_at + len(filtered_tickets)
-
-            if total_pages > 1:
-                col_p1, col_p2, col_p3 = st.columns([1, 2, 1])
-                with col_p1:
-                    if current_page > 1:
-                        st.button("⬅️ Previous Page", on_click=go_prev_page, use_container_width=True)
-                with col_p2:
-                    st.markdown(
-                        f"<div style='text-align: center; padding-top: 6px;'>"
-                        f"Page <b>{current_page}</b> of <b>{total_pages}</b> "
-                        f"(Showing {first_item_num}–{last_item_num} of {total_available} tasks)"
-                        f"</div>",
-                        unsafe_allow_html=True,
-                    )
-                with col_p3:
-                    if current_page < total_pages:
-                        st.button("Next Page ➡️", on_click=go_next_page, use_container_width=True)
-            else:
-                st.markdown(
-                    f"<div style='text-align: center; color: gray; padding-top: 5px;'>"
-                    f"Showing all {total_available} tasks for this view."
-                    f"</div>",
-                    unsafe_allow_html=True,
-                )
+                        st.error(f"Error: {resp.text}")
         else:
-            st.warning("No tickets found matching the selected project filter.")
+            if "Azure" in chosen_provider:
+                with st.form("azure_creds_form"):
+                    tenant_id = st.text_input("Tenant ID", placeholder="tenant-id")
+                    client_id = st.text_input("Client ID", placeholder="client-id")
+                    client_secret = st.text_input("Client Secret", type="password", placeholder="client-secret")
+                    subscription_id = st.text_input("Subscription ID", placeholder="subscription-id")
+                    if st.form_submit_button("🚀 Connect Azure", use_container_width=True):
+                        resp = httpx.post(f"{BACKEND_URL}/cloud/connect/azure", params={"session_id": SESSION_ID}, json={"tenant_id": tenant_id, "client_id": client_id, "client_secret": client_secret, "subscription_id": subscription_id, "use_sandbox": False}, timeout=20.0)
+                        if resp.status_code == 200:
+                            st.toast("Azure connected!", icon="☁️")
+                            st.rerun()
+                        else:
+                            st.error(f"Error: {resp.text}")
+            else:
+                with st.form("aws_creds_form"):
+                    access_key = st.text_input("AWS Access Key ID", placeholder="AKIA...")
+                    secret_key = st.text_input("AWS Secret Access Key", type="password", placeholder="secret...")
+                    aws_region = st.text_input("AWS Region", value="ap-south-1")
+                    if st.form_submit_button("🚀 Connect AWS", use_container_width=True):
+                        resp = httpx.post(f"{BACKEND_URL}/cloud/connect/aws", params={"session_id": SESSION_ID}, json={"access_key_id": access_key, "secret_access_key": secret_key, "region": aws_region, "use_sandbox": False}, timeout=20.0)
+                        if resp.status_code == 200:
+                            st.toast("AWS connected!", icon="☁️")
+                            st.rerun()
+                        else:
+                            st.error(f"Error: {resp.text}")
 
     st.divider()
+    st.markdown("#### ⚙️ Settings")
+    st.checkbox("Human-in-the-Loop Review Gate", value=True)
 
-    col_input, col_cloud, col_btn = st.columns([3, 2, 2])
-    with col_input:
-        default_key = filtered_tickets[0]["key"] if filtered_tickets else "KAN-1"
-        ticket_key_input = st.text_input("Enter Jira Ticket ID to Diagnose", value=default_key)
-    with col_cloud:
-        cloud_hint = st.selectbox("Cloud Environment Override", ["AUTO", "AZURE", "AWS"])
-    with col_btn:
-        st.write("")
-        st.write("")
-        run_btn = st.button("🔍 Run Agentic Diagnostics", type="primary", use_container_width=True)
+# ---------------- MAIN WORKSPACE: GEMINI-STYLE CONVERSATIONAL CHAT ----------------
+st.markdown("## 🤖 Autonomous Production Troubleshooter")
+st.caption("Chat naturally with your AI Reliability Engineer to query workspace items, summarize tasks, or run diagnostics.")
+st.divider()
 
-    if run_btn and ticket_key_input:
-        with st.spinner(f"Executing Agentic StateGraph Loop for {ticket_key_input}..."):
-            resp = httpx.post(
-                f"{BACKEND_URL}/agent/investigate",
-                json={
-                    "session_id": SESSION_ID,
-                    "ticket_key": ticket_key_input,
-                    "cloud_provider_hint": cloud_hint,
-                },
-                timeout=60.0,
-            )
-
-        if resp.status_code != 200:
-            st.error(f"Investigation Failed: {resp.text}")
-        else:
-            report = resp.json()
-            t_data = report["ticket_data"]
-
-            left_col, right_col = st.columns([1, 2])
-
-            with left_col:
-                st.subheader("⚡ Live Agent Execution Trace")
-                for step in report["execution_trace"]:
+for idx, message in enumerate(st.session_state["messages"]):
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+        if "report" in message:
+            rep = message["report"]
+            tab_trace, tab_rca, tab_fix, tab_comment = st.tabs(["⚡ Execution Trace", "🧠 Analysis", "🛠️ Fix", "💬 Comment"])
+            
+            with tab_trace:
+                for step in rep["execution_trace"]:
                     with st.container(border=True):
                         st.markdown(f"**🟢 {step['step_name']}**")
                         st.caption(f"Tool: `{step['tool_used']}`")
-                        st.write(step["details"])
+                        st.code(step["details"], language="text")
+            with tab_rca:
+                st.info(rep["root_cause_analysis"])
+            with tab_fix:
+                st.markdown(rep["recommended_fix"])
+            with tab_comment:
+                st.code(rep["draft_jira_comment"], language="markdown")
+                ticket_key_val = rep['ticket_data'].get('ticket_key', 'GENERAL-1')
+                
+                # FIX: Using globally unique key combining ticket_key and message loop index (idx)
+                if st.button("🚀 Approve & Post Update to Jira", key=f"btn_{ticket_key_val}_{idx}"):
+                    st.success("Successfully posted diagnostic report to Jira ticket comments!")
 
-                st.subheader("📌 Extracted Ticket Context")
-                st.write(f"**Summary:** {t_data['summary']}")
-                st.write(f"**Status:** `{t_data['status']}` | **Priority:** `{t_data['priority']}`")
-                st.write(f"**Detected Cloud:** `{report['detected_cloud']}`")
-                st.write(f"**Target Resource:** `{report['affected_resource_type']}`")
-                with st.expander("Raw Ticket Description & Comments"):
-                    st.write(t_data["description"])
-                    if t_data["comments"]:
-                        st.markdown("**Comments:**")
-                        for c in t_data["comments"]:
-                            st.markdown(f"- {c}")
+prompt = st.chat_input("Ask anything (e.g., 'Explain KAN-1', 'Give me full details of KAN-1', or 'Investigate KAN-1')...")
 
-            with right_col:
-                st.subheader("🧠 Root Cause Analysis")
-                st.info(report["root_cause_analysis"])
+if prompt:
+    st.session_state["messages"].append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
 
-                st.subheader("🛠️ Recommended Engineering Fix")
-                st.markdown(report["recommended_fix"])
+    with st.chat_message("assistant"):
+        with st.spinner(f"🤖 Processing query: '{prompt}'..."):
+            try:
+                resp = httpx.post(
+                    f"{BACKEND_URL}/agent/investigate",
+                    json={
+                        "session_id": SESSION_ID,
+                        "ticket_key": prompt,
+                        "cloud_provider_hint": "AUTO",
+                    },
+                    timeout=60.0,
+                )
 
-                st.subheader("💬 Ready-to-Post Jira Update")
-                st.code(report["draft_jira_comment"], language="markdown")
+                if resp.status_code == 200:
+                    report = resp.json()
+                    response_text = report["root_cause_analysis"]
+                    
+                    st.markdown(response_text)
+                    
+                    if report["execution_trace"]:
+                        tab_trace, tab_rca, tab_fix, tab_comment = st.tabs(["⚡ Execution Trace", "🧠 Analysis", "🛠️ Fix", "💬 Comment"])
+                        with tab_trace:
+                            for step in report["execution_trace"]:
+                                with st.container(border=True):
+                                    st.markdown(f"**🟢 {step['step_name']}**")
+                                    st.caption(f"Tool: `{step['tool_used']}`")
+                                    st.code(step["details"], language="text")
+                        with tab_rca:
+                            st.info(report["root_cause_analysis"])
+                        with tab_fix:
+                            st.markdown(report["recommended_fix"])
+                        with tab_comment:
+                            st.code(report["draft_jira_comment"], language="markdown")
+
+                    st.session_state["messages"].append({
+                        "role": "assistant",
+                        "content": response_text,
+                        "report": report
+                    })
+                else:
+                    err_msg = f"Query failed: {resp.text}"
+                    st.error(err_msg)
+                    st.session_state["messages"].append({"role": "assistant", "content": err_msg})
+            except Exception as e:
+                err_msg = f"Connection error: {e}"
+                st.error(err_msg)
+                st.session_state["messages"].append({"role": "assistant", "content": err_msg})

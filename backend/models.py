@@ -49,6 +49,24 @@ class JiraTicketData(BaseModel):
     attachments: List[JiraAttachment] = Field(default_factory=list)
 
 
+class JiraTicketResponse(BaseModel):
+    ticket_key: str = Field(..., alias="key")
+    summary: str
+    description: Optional[str] = None
+    status: str
+    priority: str
+    issue_type: str = "Task"
+    reporter: str = "System Board"
+    created: str = ""
+    labels: List[str] = Field(default_factory=list)
+    components: List[str] = Field(default_factory=list)
+    comments: List[str] = Field(default_factory=list)
+    attachments: List[JiraAttachment] = Field(default_factory=list)
+
+    class Config:
+        populate_by_name = True
+
+
 class InvestigateRequest(BaseModel):
     session_id: str = "default-engineer-session"
     ticket_key: str = Field(..., examples=["PROD-101"])
