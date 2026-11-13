@@ -1,14 +1,14 @@
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from typing import Optional, cast
+import json
+from typing import Optional
 from backend.config import settings
 from backend.models import (
     JiraSessionState,
     PATConnectRequest,
-    InvestigateRequest,
-    InvestigationReport,
-    JiraTicketData,
+    ChatRequest,
+    ChatResponse,
 )
 from backend.auth_jira import (
     get_or_create_session,
@@ -18,7 +18,7 @@ from backend.auth_jira import (
     connect_via_pat,
 )
 from backend.jira_service import JiraClientService
-from backend.agent_graph import incident_graph, IncidentAgentState
+from backend.agent import answer_question, stream_answer
 from backend.cloud_connector import (
     CloudSessionState,
     AzureConnectRequest,
@@ -136,68 +136,21 @@ async def disconnect_cloud(session_id: str = Query(default="default-engineer-ses
     return disconnect_cloud_session(session_id)
 
 
-# ---------------- AGENT ORCHESTRATOR ENDPOINT ----------------
-@app.post("/agent/investigate", response_model=InvestigationReport)
-async def run_incident_investigation(req: InvestigateRequest):
-    session = get_or_create_session(req.session_id)
-    if not session.connected:
-        raise HTTPException(status_code=401, detail="Please connect to Jira first.")
+# ---------------- AGENT CHAT ENDPOINT ----------------
+@app.post("/agent/chat", response_model=ChatResponse)
+async def agent_chat(req: ChatRequest):
+    return await answer_question(session_id=req.session_id, message=req.message, history=req.history)
 
-    cloud_session = get_or_create_cloud_session(req.session_id)
 
-    initial_state = cast(IncidentAgentState, {
-        "session": session,
-        "ticket_key": req.ticket_key.strip().upper(),
-        "user_query": req.ticket_key,
-        "cloud_hint": cloud_session.provider or req.cloud_provider_hint,
-        "ticket_data": None,
-        "detected_cloud": "",
-        "affected_resource_type": "",
-        "execution_trace": [],
-        "root_cause_analysis": "",
-        "recommended_fix": "",
-        "draft_jira_comment": "",
-        "chat_response": "",
-        "is_list_query": False,
-        "is_investigation_query": False,
-    })
+@app.post("/agent/chat/stream")
+async def agent_chat_stream(req: ChatRequest):
+    """Server-sent events: one JSON object per 'data:' line (delta, reset, status, done)."""
 
-    final_state = await incident_graph.ainvoke(initial_state)
-    
-    ticket_data = final_state["ticket_data"]
-    if final_state.get("is_list_query"):
-        ticket_data = JiraTicketData(
-            ticket_key="BOARD",
-            summary="Workspace Ticket Listing",
-            description=final_state["chat_response"],
-            status="Active",
-            priority="Medium",
-            issue_type="Task",
-            reporter="AI Agent",
-            created=""
-        )
-    elif not ticket_data:
-        ticket_data = JiraTicketData(
-            ticket_key=final_state.get("ticket_key", "UNKNOWN"),
-            summary="Ticket Lookup Result",
-            description=final_state["chat_response"],
-            status="Unknown",
-            priority="Medium",
-            issue_type="Task",
-            reporter="AI Agent",
-            created=""
-        )
+    async def events():
+        async for event in stream_answer(session_id=req.session_id, message=req.message, history=req.history):
+            if "execution_trace" in event:
+                event = {**event, "execution_trace": [step.model_dump() for step in event["execution_trace"]]}
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
-    rca_text = final_state["root_cause_analysis"] if final_state.get("is_investigation_query") else final_state["chat_response"]
-    fix_text = final_state["recommended_fix"] if final_state.get("is_investigation_query") else "No code patch generated (Detail lookup mode)."
-    comment_text = final_state["draft_jira_comment"] if final_state.get("is_investigation_query") else f"Reviewed details for {ticket_data.ticket_key}."
-
-    return InvestigationReport(
-        ticket_data=ticket_data,
-        detected_cloud=final_state["detected_cloud"] or "None",
-        affected_resource_type=final_state["affected_resource_type"] or "N/A",
-        execution_trace=final_state["execution_trace"],
-        root_cause_analysis=rca_text,
-        recommended_fix=fix_text,
-        draft_jira_comment=comment_text,
-    )
+    headers = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    return StreamingResponse(events(), media_type="text/event-stream", headers=headers)

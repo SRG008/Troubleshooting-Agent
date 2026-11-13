@@ -67,10 +67,15 @@ class JiraTicketResponse(BaseModel):
         populate_by_name = True
 
 
-class InvestigateRequest(BaseModel):
+class ChatTurn(BaseModel):
+    role: str = Field(..., examples=["user", "assistant"])
+    content: str
+
+
+class ChatRequest(BaseModel):
     session_id: str = "default-engineer-session"
-    ticket_key: str = Field(..., examples=["PROD-101"])
-    cloud_provider_hint: str = Field(default="AUTO", description="AUTO, AZURE, or AWS")
+    message: str = Field(..., min_length=1, examples=["How many bugs are in the active sprint?"])
+    history: List[ChatTurn] = Field(default_factory=list)
 
 
 class AgentStepTrace(BaseModel):
@@ -80,11 +85,7 @@ class AgentStepTrace(BaseModel):
     details: str
 
 
-class InvestigationReport(BaseModel):
-    ticket_data: JiraTicketData
-    detected_cloud: str
-    affected_resource_type: str
-    execution_trace: List[AgentStepTrace]
-    root_cause_analysis: str
-    recommended_fix: str
-    draft_jira_comment: str
+class ChatResponse(BaseModel):
+    answer: str
+    provider: Optional[str] = None
+    execution_trace: List[AgentStepTrace] = Field(default_factory=list)

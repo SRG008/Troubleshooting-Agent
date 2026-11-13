@@ -28,16 +28,18 @@ class JiraClientService:
             raise HTTPException(status_code=401, detail="Jira session is not connected.")
         self.session = session
 
-    def _get_base_url_and_auth(self) -> Tuple[str, Dict[str, str], Optional[Tuple[str, str]]]:
+    def _get_base_url_and_auth(
+        self, api_root: str = "rest/api/3"
+    ) -> Tuple[str, Dict[str, str], Optional[Tuple[str, str]]]:
         if self.session.auth_mode == "oauth2":
-            base_url = f"https://api.atlassian.com/ex/jira/{self.session.cloud_id}/rest/api/3"
+            base_url = f"https://api.atlassian.com/ex/jira/{self.session.cloud_id}/{api_root}"
             headers = {
                 "Authorization": f"Bearer {self.session.access_token}",
                 "Accept": "application/json",
             }
             auth = None
         else:
-            base_url = f"{self.session.site_url}/rest/api/3"
+            base_url = f"{self.session.site_url}/{api_root}"
             headers = {"Accept": "application/json"}
             auth = (self.session.email or "", self.session.access_token or "")
         return base_url, headers, auth
@@ -185,3 +187,133 @@ class JiraClientService:
             comments=comments,
             attachments=attachments,
         )
+
+    async def fetch_boards(self, project_key: Optional[str] = None, max_results: int = 200) -> List[Dict[str, Any]]:
+        """Lists agile boards (Scrum/Kanban), optionally limited to one project."""
+        base_url, headers, auth = self._get_base_url_and_auth("rest/agile/1.0")
+        params: Dict[str, Any] = {}
+        if project_key:
+            params["projectKeyOrId"] = project_key
+        boards = await self._paginate_offset(f"{base_url}/board", params, headers, auth, max_results)
+        return [
+            {
+                "id": str(b.get("id")),
+                "name": b.get("name"),
+                "type": b.get("type"),
+                "project_key": (b.get("location") or {}).get("projectKey"),
+            }
+            for b in boards
+        ]
+
+    async def fetch_sprints(
+        self, board_id: str, state: Optional[str] = None, max_results: int = 200
+    ) -> List[Dict[str, Any]]:
+        """Lists sprints of a board, optionally filtered by state (active, future, closed)."""
+        base_url, headers, auth = self._get_base_url_and_auth("rest/agile/1.0")
+        params: Dict[str, Any] = {}
+        if state:
+            params["state"] = state
+        sprints = await self._paginate_offset(
+            f"{base_url}/board/{board_id}/sprint", params, headers, auth, max_results
+        )
+        return [
+            {
+                "id": str(s.get("id")),
+                "name": s.get("name"),
+                "state": s.get("state"),
+                "start_date": s.get("startDate"),
+                "end_date": s.get("endDate"),
+                "goal": s.get("goal"),
+            }
+            for s in sprints
+        ]
+
+    async def search_issues(self, jql: str, max_results: int = 50) -> List[Dict[str, Any]]:
+        """Runs a JQL query and returns up to max_results issues in a compact form."""
+        base_url, headers, auth = self._get_base_url_and_auth()
+        limit = max(1, min(max_results, 100))
+        issues: List[Dict[str, Any]] = []
+        next_page_token: Optional[str] = None
+
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            while len(issues) < limit:
+                params: Dict[str, Any] = {
+                    "jql": jql,
+                    "maxResults": min(100, limit - len(issues)),
+                    "fields": _ISSUE_FIELDS,
+                }
+                if next_page_token:
+                    params["nextPageToken"] = next_page_token
+
+                resp = await client.get(f"{base_url}/search/jql", params=params, headers=headers, auth=auth)
+                _ensure_ok(resp)
+                data = resp.json()
+                batch = data.get("issues", [])
+                issues.extend(batch)
+
+                next_page_token = data.get("nextPageToken")
+                if not next_page_token or data.get("isLast", True) or not batch:
+                    break
+
+        return [_map_issue(i) for i in issues[:limit]]
+
+    async def count_issues(self, jql: str) -> int:
+        """Returns the number of issues matching a JQL query."""
+        base_url, headers, auth = self._get_base_url_and_auth()
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(
+                f"{base_url}/search/approximate-count", json={"jql": jql}, headers=headers, auth=auth
+            )
+        _ensure_ok(resp)
+        return int(resp.json().get("count", 0))
+
+    async def _paginate_offset(
+        self,
+        url: str,
+        params: Dict[str, Any],
+        headers: Dict[str, str],
+        auth: Optional[Tuple[str, str]],
+        max_results: int,
+    ) -> List[Dict[str, Any]]:
+        """Collects values from an offset-paginated Agile endpoint (startAt / isLast)."""
+        items: List[Dict[str, Any]] = []
+        start_at = 0
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            while len(items) < max_results:
+                page_params = {**params, "startAt": start_at, "maxResults": min(50, max_results - len(items))}
+                resp = await client.get(url, params=page_params, headers=headers, auth=auth)
+                _ensure_ok(resp)
+                data = resp.json()
+                values = data.get("values", [])
+                items.extend(values)
+                start_at += len(values)
+                if data.get("isLast", True) or not values:
+                    break
+        return items[:max_results]
+
+
+_ISSUE_FIELDS = "summary,status,priority,issuetype,project,assignee,created,updated,duedate,labels"
+
+
+def _ensure_ok(resp: httpx.Response) -> None:
+    if resp.status_code != 200:
+        raise HTTPException(status_code=resp.status_code, detail=f"Jira API error: {resp.text}")
+
+
+def _map_issue(issue: Dict[str, Any]) -> Dict[str, Any]:
+    f = issue.get("fields", {}) or {}
+    proj = f.get("project") or {}
+    return {
+        "key": issue.get("key"),
+        "summary": f.get("summary"),
+        "type": (f.get("issuetype") or {}).get("name"),
+        "status": (f.get("status") or {}).get("name"),
+        "priority": (f.get("priority") or {}).get("name"),
+        "assignee": (f.get("assignee") or {}).get("displayName"),
+        "project_key": proj.get("key"),
+        "project_name": proj.get("name"),
+        "labels": f.get("labels", []),
+        "due_date": f.get("duedate"),
+        "created": f.get("created"),
+        "updated": f.get("updated"),
+    }

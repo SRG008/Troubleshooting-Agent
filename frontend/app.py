@@ -1,7 +1,9 @@
 import streamlit as st
 import httpx
+import json
+import time
 
-BACKEND_URL = "http://localhost:8000"
+BACKEND_URL = "http://127.0.0.1:8000"
 SESSION_ID = "default-engineer-session"
 
 st.set_page_config(
@@ -36,29 +38,38 @@ if "action" in query_params:
     action_val = query_params["action"]
     if action_val == "connected":
         st.session_state["trigger_toast"] = ("Successfully connected to Jira workspace via OAuth!", "🎉")
+        st.session_state["refresh_status"] = True
     st.query_params.clear()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _get_status(path):
+    # Raises on failure so that failed responses are not cached.
+    r = httpx.get(f"{BACKEND_URL}{path}", params={"session_id": SESSION_ID}, timeout=5.0)
+    r.raise_for_status()
+    return r.json()
 
 
 def fetch_connection_status():
     try:
-        r = httpx.get(f"{BACKEND_URL}/auth/jira/status", params={"session_id": SESSION_ID}, timeout=5.0)
-        if r.status_code == 200:
-            return r.json()
+        return _get_status("/auth/jira/status")
     except Exception:
         return None
-    return None
 
 
 def fetch_cloud_status():
     try:
-        r = httpx.get(f"{BACKEND_URL}/cloud/status", params={"session_id": SESSION_ID}, timeout=5.0)
-        if r.status_code == 200:
-            return r.json()
+        return _get_status("/cloud/status")
     except Exception:
         return None
-    return None
 
 
+def refresh_status_cache():
+    _get_status.clear()
+
+
+if st.session_state.pop("refresh_status", False):
+    refresh_status_cache()
 status_data = fetch_connection_status()
 cloud_status = fetch_cloud_status()
 
@@ -71,7 +82,7 @@ if "messages" not in st.session_state:
     st.session_state["messages"] = [
         {
             "role": "assistant",
-            "content": "👋 **Hello Engineer!** I am your **Autonomous AI Reliability Engineer**. Connect your workspace in the sidebar, then type a request (e.g., *'Explain KAN-1'*, *'Give me full details of KAN-1'*, *'How many tasks are there total'*, or *'Investigate KAN-1'*) to query your board.",
+            "content": "👋 **Hello!** I am an AI assistant using Copilot SDK in VS Code. Connect your workspace in the sidebar, then ask anything about your projects, boards, sprints, or work items, for example *'How many open bugs are in project X?'*, *'Show the active sprint for board Y'*, or *'What is KAN-1 about?'*.",
         }
     ]
 
@@ -89,6 +100,7 @@ with st.sidebar:
         if st.button("Disconnect Workspace", type="secondary", use_container_width=True):
             httpx.post(f"{BACKEND_URL}/auth/jira/disconnect", params={"session_id": SESSION_ID}, timeout=5.0)
             st.toast("Disconnected.", icon="🔌")
+            refresh_status_cache()
             st.rerun()
     else:
         st.warning("🔴 Disconnected")
@@ -120,6 +132,7 @@ with st.sidebar:
                         )
                         if resp.status_code == 200:
                             st.toast("Connected successfully!", icon="🎉")
+                            refresh_status_cache()
                             st.rerun()
                         else:
                             st.error(f"Failed: {resp.text}")
@@ -134,6 +147,7 @@ with st.sidebar:
         if st.button("Disconnect Cloud", type="secondary", use_container_width=True):
             httpx.post(f"{BACKEND_URL}/cloud/disconnect", params={"session_id": SESSION_ID}, timeout=5.0)
             st.toast("Disconnected Cloud Provider.", icon="🔌")
+            refresh_status_cache()
             st.rerun()
     else:
         st.warning("🔴 Cloud Unconnected")
@@ -154,6 +168,7 @@ with st.sidebar:
                     resp = httpx.post(f"{BACKEND_URL}/cloud/connect/{endpoint}", params={"session_id": SESSION_ID}, json=payload, timeout=10.0)
                     if resp.status_code == 200:
                         st.toast("Sandbox connected successfully!", icon="☁️")
+                        refresh_status_cache()
                         st.rerun()
                     else:
                         st.error(f"Error: {resp.text}")
@@ -168,6 +183,7 @@ with st.sidebar:
                         resp = httpx.post(f"{BACKEND_URL}/cloud/connect/azure", params={"session_id": SESSION_ID}, json={"tenant_id": tenant_id, "client_id": client_id, "client_secret": client_secret, "subscription_id": subscription_id, "use_sandbox": False}, timeout=20.0)
                         if resp.status_code == 200:
                             st.toast("Azure connected!", icon="☁️")
+                            refresh_status_cache()
                             st.rerun()
                         else:
                             st.error(f"Error: {resp.text}")
@@ -180,6 +196,7 @@ with st.sidebar:
                         resp = httpx.post(f"{BACKEND_URL}/cloud/connect/aws", params={"session_id": SESSION_ID}, json={"access_key_id": access_key, "secret_access_key": secret_key, "region": aws_region, "use_sandbox": False}, timeout=20.0)
                         if resp.status_code == 200:
                             st.toast("AWS connected!", icon="☁️")
+                            refresh_status_cache()
                             st.rerun()
                         else:
                             st.error(f"Error: {resp.text}")
@@ -190,85 +207,107 @@ with st.sidebar:
 
 # ---------------- MAIN WORKSPACE: GEMINI-STYLE CONVERSATIONAL CHAT ----------------
 st.markdown("## 🤖 Autonomous Production Troubleshooter")
-st.caption("Chat naturally with your AI Reliability Engineer to query workspace items, summarize tasks, or run diagnostics.")
+st.caption("Ask any question about your connected workspace: boards, sprints, work items, counts, or details.")
 st.divider()
 
-for idx, message in enumerate(st.session_state["messages"]):
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-        if "report" in message:
-            rep = message["report"]
-            tab_trace, tab_rca, tab_fix, tab_comment = st.tabs(["⚡ Execution Trace", "🧠 Analysis", "🛠️ Fix", "💬 Comment"])
-            
-            with tab_trace:
-                for step in rep["execution_trace"]:
-                    with st.container(border=True):
-                        st.markdown(f"**🟢 {step['step_name']}**")
-                        st.caption(f"Tool: `{step['tool_used']}`")
-                        st.code(step["details"], language="text")
-            with tab_rca:
-                st.info(rep["root_cause_analysis"])
-            with tab_fix:
-                st.markdown(rep["recommended_fix"])
-            with tab_comment:
-                st.code(rep["draft_jira_comment"], language="markdown")
-                ticket_key_val = rep['ticket_data'].get('ticket_key', 'GENERAL-1')
-                
-                # FIX: Using globally unique key combining ticket_key and message loop index (idx)
-                if st.button("🚀 Approve & Post Update to Jira", key=f"btn_{ticket_key_val}_{idx}"):
-                    st.success("Successfully posted diagnostic report to Jira ticket comments!")
+def render_message(message):
+    # Same element tree as a live run (status, then answer). Streamlit greys out
+    # elements from the previous run that were not re-emitted, so the tree must match.
+    if message["role"] == "assistant" and "status" in message:
+        label, state = message["status"]
+        st.status(label, state=state, expanded=False)
+    st.markdown(message["content"])
 
-prompt = st.chat_input("Ask anything (e.g., 'Explain KAN-1', 'Give me full details of KAN-1', or 'Investigate KAN-1')...")
+
+# The input is at page level so Streamlit pins it to the bottom of the screen.
+prompt = st.chat_input("Ask anything about your boards, sprints, or work items...")
 
 if prompt:
+    history = [
+        {"role": m["role"], "content": m["content"]}
+        for m in st.session_state["messages"]
+        if not m.get("pending")
+    ]
     st.session_state["messages"].append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+    st.session_state["messages"].append(
+        {"role": "assistant", "content": "", "pending": True, "question": prompt, "history": history}
+    )
 
-    with st.chat_message("assistant"):
-        with st.spinner(f"🤖 Processing query: '{prompt}'..."):
+
+def render_conversation():
+    for message in st.session_state["messages"]:
+        with st.chat_message(message["role"]):
+            if not message.get("pending"):
+                render_message(message)
+                continue
+
+            started = time.monotonic()
+            status = st.status("Thinking...", expanded=False)
+            answer_box = st.empty()
+            text = ""
+            finished = False
+            last_draw = 0.0
             try:
-                resp = httpx.post(
-                    f"{BACKEND_URL}/agent/investigate",
+                with httpx.stream(
+                    "POST",
+                    f"{BACKEND_URL}/agent/chat/stream",
                     json={
                         "session_id": SESSION_ID,
-                        "ticket_key": prompt,
-                        "cloud_provider_hint": "AUTO",
+                        "message": message["question"],
+                        "history": message["history"],
                     },
-                    timeout=60.0,
-                )
-
-                if resp.status_code == 200:
-                    report = resp.json()
-                    response_text = report["root_cause_analysis"]
-                    
-                    st.markdown(response_text)
-                    
-                    if report["execution_trace"]:
-                        tab_trace, tab_rca, tab_fix, tab_comment = st.tabs(["⚡ Execution Trace", "🧠 Analysis", "🛠️ Fix", "💬 Comment"])
-                        with tab_trace:
-                            for step in report["execution_trace"]:
-                                with st.container(border=True):
-                                    st.markdown(f"**🟢 {step['step_name']}**")
-                                    st.caption(f"Tool: `{step['tool_used']}`")
-                                    st.code(step["details"], language="text")
-                        with tab_rca:
-                            st.info(report["root_cause_analysis"])
-                        with tab_fix:
-                            st.markdown(report["recommended_fix"])
-                        with tab_comment:
-                            st.code(report["draft_jira_comment"], language="markdown")
-
-                    st.session_state["messages"].append({
-                        "role": "assistant",
-                        "content": response_text,
-                        "report": report
-                    })
-                else:
-                    err_msg = f"Query failed: {resp.text}"
-                    st.error(err_msg)
-                    st.session_state["messages"].append({"role": "assistant", "content": err_msg})
+                    timeout=120.0,
+                ) as resp:
+                    if resp.status_code != 200:
+                        resp.read()
+                        message["content"] = f"Query failed: {resp.text}"
+                        message["trace"] = []
+                        message["status"] = ("Query failed", "error")
+                        status.update(label="Query failed", state="error")
+                        finished = True
+                    else:
+                        for line in resp.iter_lines():
+                            if not line.startswith("data:"):
+                                continue
+                            event = json.loads(line[5:])
+                            kind = event.get("type")
+                            if kind == "delta":
+                                text += event["text"]
+                                if time.monotonic() - last_draw > 0.05:
+                                    answer_box.markdown(text + " ▌")
+                                    last_draw = time.monotonic()
+                            elif kind == "reset":
+                                text = ""
+                                answer_box.empty()
+                            elif kind == "status":
+                                status.update(label=event.get("message", "Working..."))
+                            elif kind == "done":
+                                message["content"] = event.get("answer", "")
+                                message["trace"] = event.get("execution_trace", [])
+                                message["elapsed"] = time.monotonic() - started
+                                label = f"Answered in {message['elapsed']:.1f}s"
+                                message["status"] = (label, "complete")
+                                status.update(label=label, state="complete")
+                                finished = True
+                        if not finished:
+                            message["content"] = text or "The connection ended before an answer was received."
+                            message["trace"] = []
+                            message["status"] = ("Connection ended early", "error")
+                            status.update(label="Connection ended early", state="error")
             except Exception as e:
-                err_msg = f"Connection error: {e}"
-                st.error(err_msg)
-                st.session_state["messages"].append({"role": "assistant", "content": err_msg})
+                message["content"] = f"Connection error: {e}"
+                message["trace"] = []
+                message["status"] = ("Connection error", "error")
+                status.update(label="Connection error", state="error")
+
+            # Keep the streamed answer in place so the element tree matches the reloaded one.
+            answer_box.markdown(message["content"])
+            message.pop("pending", None)
+            message.pop("question", None)
+            message.pop("history", None)
+
+
+chat_slot = st.empty()
+with chat_slot.container():
+    render_conversation()
+
