@@ -5,11 +5,18 @@ A chat assistant built with **FastAPI**, **Pydantic**, and **Streamlit**. The LL
 Ask any question about your connected workspace (projects, boards, sprints, work items, counts, details). The model chooses the tools and writes the native query itself, so nothing is hardcoded to specific questions. Jira is supported today.
 
 ## How the agent works
-- `backend/agent.py` runs a provider-agnostic tool-calling loop. The model picks from six generic tools: `list_projects`, `list_boards`, `list_sprints`, `search_work_items`, `count_work_items`, `get_work_item`.
+- `backend/agent.py` runs a provider-agnostic tool-calling loop. The model picks from generic tools: `list_projects`, `list_boards`, `list_sprints`, `search_work_items`, `count_work_items`, `get_work_item`, `list_issue_types`, `get_required_fields`, `search_users`, `create_work_item`, and `ask_user`.
 - Each tool is backed by an `IssueTracker` (`backend/trackers/base.py`). The agent only talks to this interface.
-- `backend/trackers/jira_tracker.py` implements it for Jira. The query language is JQL, and the guidance is in `query_guide`.
+- `backend/trackers/jira_tracker.py` implements it for Jira. The query language is JQL, and the guidance is in `query_guide`. Required fields for creating an issue come from Jira's `createmeta` API, so no field list is hardcoded.
 - `backend/trackers/registry.py` lists the providers in `TRACKER_PROVIDERS`. The first provider whose session is connected is used.
-- `POST /agent/chat` takes `{session_id, message, history}` and returns `{answer, provider, execution_trace}`.
+- `POST /agent/chat/stream` takes `{session_id, message, history}` and streams SSE events. The final event is `done` with `{answer, provider, execution_trace}`.
+- `POST /agent/chat/resume` takes `{session_id, pending_id, answer}` and continues a run paused on an `ask` event. `answer` is `null` when the user skips the question.
+
+### Interactive questions (`ask_user`)
+- When the request is ambiguous (for example, "how many tasks?" with several projects) or a create flow needs a value, the model calls `ask_user` with one question, an `input_type` (`choice`, `text`, `number`, `date`, or `boolean`), and options for choices.
+- The run pauses and emits an `ask` event. The frontend shows one question at a time as a native widget and posts the answer to `/agent/chat/resume`. The run then continues from the same point, updating the same assistant message rather than adding a new chat exchange. Previous selections remain visible as a compact summary. The chat input stays disabled until the flow completes or is cancelled.
+- Creating a work item asks only for the fields Jira marks as required. Optional fields are skipped. The agent confirms the summary before it creates the item.
+- Pending questions are kept in memory for 30 minutes, so they are lost on backend restart. An expired question returns a message asking the user to retry.
 
 ### LLM layer (`backend/llm/`)
 - `base.py` defines neutral message and tool types. The agent only uses these.

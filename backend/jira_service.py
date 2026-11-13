@@ -267,6 +267,90 @@ class JiraClientService:
         _ensure_ok(resp)
         return int(resp.json().get("count", 0))
 
+    async def fetch_issue_types(self, project_key: str) -> List[Dict[str, Any]]:
+        """Issue types that can be created in a project."""
+        base_url, headers, auth = self._get_base_url_and_auth()
+        types = await self._paginate_offset(
+            f"{base_url}/issue/createmeta/{project_key}/issuetypes", {}, headers, auth, 200,
+            collection_key="issueTypes",
+        )
+        return [{"id": str(t.get("id")), "name": t.get("name")} for t in types]
+
+    async def fetch_required_fields(self, project_key: str, issue_type: str) -> List[Dict[str, Any]]:
+        """Required creation fields of an issue type, with their allowed values where Jira defines them."""
+        _, metas = await self._create_field_metadata(project_key, issue_type)
+        return [
+            _describe_field(meta)
+            for meta in metas
+            if meta.get("required") and meta.get("fieldId") not in _SYSTEM_FIELDS
+        ]
+
+    async def create_issue(self, project_key: str, issue_type: str, values: Dict[str, Any]) -> Dict[str, Any]:
+        """Creates an issue. `values` maps field ids to plain answers, converted to Jira's format here."""
+        issue_type_id, metas = await self._create_field_metadata(project_key, issue_type)
+        by_id = {meta["fieldId"]: meta for meta in metas}
+
+        unknown = [field_id for field_id in values if field_id not in by_id]
+        if unknown:
+            raise ValueError(f"Unknown field ids for {issue_type}: {', '.join(unknown)}.")
+        missing = [
+            meta.get("name", meta["fieldId"])
+            for meta in metas
+            if meta.get("required")
+            and meta["fieldId"] not in _SYSTEM_FIELDS
+            and not _has_value(values.get(meta["fieldId"]))
+        ]
+        if missing:
+            raise ValueError(f"Missing required fields: {', '.join(missing)}.")
+
+        fields: Dict[str, Any] = {"project": {"key": project_key}, "issuetype": {"id": issue_type_id}}
+        for field_id, value in values.items():
+            if field_id in _SYSTEM_FIELDS or not _has_value(value):
+                continue
+            fields[field_id] = _to_field_value(by_id[field_id], value)
+
+        base_url, headers, auth = self._get_base_url_and_auth()
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(f"{base_url}/issue", json={"fields": fields}, headers=headers, auth=auth)
+        if resp.status_code not in (200, 201):
+            raise HTTPException(status_code=resp.status_code, detail=f"Jira API error: {resp.text}")
+
+        key = resp.json().get("key")
+        url = f"{self.session.site_url}/browse/{key}" if self.session.site_url and key else None
+        return {"key": key, "url": url}
+
+    async def search_users(self, query: str, max_results: int = 20) -> List[Dict[str, Any]]:
+        """Active Atlassian users matching a name or email."""
+        base_url, headers, auth = self._get_base_url_and_auth()
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.get(
+                f"{base_url}/user/search", params={"query": query, "maxResults": max_results}, headers=headers, auth=auth
+            )
+        _ensure_ok(resp)
+        return [
+            {"account_id": u.get("accountId"), "display_name": u.get("displayName")}
+            for u in resp.json()
+            if u.get("accountId") and u.get("active", True) and u.get("accountType", "atlassian") == "atlassian"
+        ]
+
+    async def _create_field_metadata(self, project_key: str, issue_type: str) -> Tuple[str, List[Dict[str, Any]]]:
+        """Returns the id of the named issue type and the raw creation metadata of all its fields."""
+        base_url, headers, auth = self._get_base_url_and_auth()
+        types = await self._paginate_offset(
+            f"{base_url}/issue/createmeta/{project_key}/issuetypes", {}, headers, auth, 200,
+            collection_key="issueTypes",
+        )
+        match = next((t for t in types if (t.get("name") or "").lower() == issue_type.lower()), None)
+        if match is None:
+            available = ", ".join(t.get("name", "?") for t in types) or "none"
+            raise ValueError(f"Issue type '{issue_type}' not found in project {project_key}. Available: {available}.")
+        issue_type_id = str(match["id"])
+        metas = await self._paginate_offset(
+            f"{base_url}/issue/createmeta/{project_key}/issuetypes/{issue_type_id}", {}, headers, auth, 500,
+            collection_key="fields",
+        )
+        return issue_type_id, metas
+
     async def _paginate_offset(
         self,
         url: str,
@@ -274,8 +358,9 @@ class JiraClientService:
         headers: Dict[str, str],
         auth: Optional[Tuple[str, str]],
         max_results: int,
+        collection_key: str = "values",
     ) -> List[Dict[str, Any]]:
-        """Collects values from an offset-paginated Agile endpoint (startAt / isLast)."""
+        """Collects offset-paginated Agile or creation metadata results."""
         items: List[Dict[str, Any]] = []
         start_at = 0
         async with httpx.AsyncClient(timeout=20.0) as client:
@@ -284,15 +369,82 @@ class JiraClientService:
                 resp = await client.get(url, params=page_params, headers=headers, auth=auth)
                 _ensure_ok(resp)
                 data = resp.json()
-                values = data.get("values", [])
+                values = data.get(collection_key)
+                if not isinstance(values, list):
+                    raise ValueError(f"Jira API response is missing the '{collection_key}' result list.")
                 items.extend(values)
                 start_at += len(values)
-                if data.get("isLast", True) or not values:
+                is_last = data.get("isLast")
+                if is_last is None:
+                    is_last = start_at >= data.get("total", start_at)
+                if is_last or not values:
                     break
         return items[:max_results]
 
 
 _ISSUE_FIELDS = "summary,status,priority,issuetype,project,assignee,created,updated,duedate,labels"
+
+
+_SYSTEM_FIELDS = {"project", "issuetype"}
+
+
+def _has_value(value: Any) -> bool:
+    return value not in (None, "", [])
+
+
+def _text_to_adf(text: str) -> Dict[str, Any]:
+    """Wraps plain text in Atlassian Document Format, one paragraph per line."""
+    paragraphs = [
+        {"type": "paragraph", "content": [{"type": "text", "text": line}]} for line in text.split("\n") if line.strip()
+    ]
+    return {"type": "doc", "version": 1, "content": paragraphs or [{"type": "paragraph", "content": []}]}
+
+
+def _allowed_label(allowed: Dict[str, Any]) -> str:
+    return str(allowed.get("name") or allowed.get("value") or allowed.get("id"))
+
+
+def _describe_field(meta: Dict[str, Any]) -> Dict[str, Any]:
+    schema = meta.get("schema") or {}
+    kind = schema.get("type")
+    if kind == "array":
+        kind = f"array of {schema.get('items')}"
+    described: Dict[str, Any] = {"field_id": meta["fieldId"], "name": meta.get("name"), "type": kind}
+    allowed = [_allowed_label(a) for a in meta.get("allowedValues") or []]
+    if allowed:
+        described["allowed_values"] = allowed[:100]
+    return described
+
+
+def _option_ref(meta: Dict[str, Any], value: Any) -> Dict[str, str]:
+    """Resolves a plain answer to a Jira reference (id) using the field's allowed values."""
+    wanted = str(value).strip().lower()
+    for allowed in meta.get("allowedValues") or []:
+        labels = {str(allowed.get(k)).lower() for k in ("id", "name", "value") if allowed.get(k) is not None}
+        if wanted in labels:
+            return {"id": str(allowed["id"])}
+    raise ValueError(f"'{value}' is not an allowed value for {meta.get('name', meta['fieldId'])}.")
+
+
+def _to_field_value(meta: Dict[str, Any], value: Any) -> Any:
+    """Converts a plain answer into the JSON shape Jira expects for this field's schema."""
+    schema = meta.get("schema") or {}
+    kind = schema.get("type")
+    if meta["fieldId"] == "description" or kind == "doc":
+        return _text_to_adf(str(value))
+    if kind == "array":
+        parts = value if isinstance(value, list) else str(value).split(",")
+        parts = [str(p).strip() for p in parts if str(p).strip()]
+        if schema.get("items") == "string":
+            return parts
+        return [_option_ref(meta, p) for p in parts]
+    if kind in ("option", "priority", "version", "component", "resolution"):
+        return _option_ref(meta, value)
+    if kind == "user":
+        return {"accountId": str(value)}
+    if kind == "number":
+        return float(value)
+    return str(value)
 
 
 def _ensure_ok(resp: httpx.Response) -> None:

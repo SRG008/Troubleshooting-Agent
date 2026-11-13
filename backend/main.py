@@ -9,6 +9,7 @@ from backend.models import (
     PATConnectRequest,
     ChatRequest,
     ChatResponse,
+    AskAnswerRequest,
 )
 from backend.auth_jira import (
     get_or_create_session,
@@ -18,7 +19,7 @@ from backend.auth_jira import (
     connect_via_pat,
 )
 from backend.jira_service import JiraClientService
-from backend.agent import answer_question, stream_answer
+from backend.agent import answer_question, stream_answer, resume_answer
 from backend.cloud_connector import (
     CloudSessionState,
     AzureConnectRequest,
@@ -144,10 +145,19 @@ async def agent_chat(req: ChatRequest):
 
 @app.post("/agent/chat/stream")
 async def agent_chat_stream(req: ChatRequest):
-    """Server-sent events: one JSON object per 'data:' line (delta, reset, status, done)."""
+    """Server-sent events: one JSON object per 'data:' line (delta, reset, status, ask, done)."""
+    return _sse(stream_answer(session_id=req.session_id, message=req.message, history=req.history))
 
+
+@app.post("/agent/chat/resume")
+async def agent_chat_resume(req: AskAnswerRequest):
+    """Continues a run that paused on an 'ask' event. Same event stream as /agent/chat/stream."""
+    return _sse(resume_answer(session_id=req.session_id, pending_id=req.pending_id, answer=req.answer))
+
+
+def _sse(events_source):
     async def events():
-        async for event in stream_answer(session_id=req.session_id, message=req.message, history=req.history):
+        async for event in events_source:
             if "execution_trace" in event:
                 event = {**event, "execution_trace": [step.model_dump() for step in event["execution_trace"]]}
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"

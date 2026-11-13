@@ -38,3 +38,19 @@ class IssueTracker(ABC):
     @abstractmethod
     async def get_work_item(self, item_id: str) -> Dict[str, Any]:
         """Full details (description, comments, ...) of one work item."""
+
+    @abstractmethod
+    async def list_issue_types(self, project_key: str) -> List[Dict[str, Any]]:
+        """Work item types (Bug, Task, Story, ...) that can be created in a project."""
+
+    @abstractmethod
+    async def get_required_fields(self, project_key: str, issue_type: str) -> List[Dict[str, Any]]:
+        """Fields that must be set to create a work item of this type. Optional fields are not returned."""
+
+    @abstractmethod
+    async def create_work_item(self, project_key: str, issue_type: str, values: Dict[str, Any]) -> Dict[str, Any]:
+        """Create a work item. `values` maps field ids (from get_required_fields) to answers."""
+
+    @abstractmethod
+    async def search_users(self, query: str) -> List[Dict[str, Any]]:
+        """Users whose name or email matches the query. Returns account ids for user fields."""

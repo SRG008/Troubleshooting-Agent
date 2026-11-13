@@ -37,3 +37,15 @@ class JiraTracker(IssueTracker):
     async def get_work_item(self, item_id: str) -> Dict[str, Any]:
         details = await self._client.fetch_ticket_details(item_id)
         return details.model_dump(exclude={"attachments"})
+
+    async def list_issue_types(self, project_key: str) -> List[Dict[str, Any]]:
+        return await self._client.fetch_issue_types(project_key)
+
+    async def get_required_fields(self, project_key: str, issue_type: str) -> List[Dict[str, Any]]:
+        return await self._client.fetch_required_fields(project_key, issue_type)
+
+    async def create_work_item(self, project_key: str, issue_type: str, values: Dict[str, Any]) -> Dict[str, Any]:
+        return await self._client.create_issue(project_key, issue_type, values)
+
+    async def search_users(self, query: str) -> List[Dict[str, Any]]:
+        return await self._client.search_users(query)

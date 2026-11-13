@@ -216,18 +216,113 @@ def render_message(message):
     if message["role"] == "assistant" and "status" in message:
         label, state = message["status"]
         st.status(label, state=state, expanded=False)
+    if message["role"] == "assistant":
+        _render_answers(message)
     st.markdown(message["content"])
+    if message.get("form"):
+        render_form(message)
+
+
+def _request_for(message):
+    if "resume" in message:
+        return f"{BACKEND_URL}/agent/chat/resume", {"session_id": SESSION_ID, **message["resume"]}
+    return f"{BACKEND_URL}/agent/chat/stream", {
+        "session_id": SESSION_ID,
+        "message": message["question"],
+        "history": message["history"],
+    }
+
+
+def _form_answer(form, value):
+    if value in (None, ""):
+        return None
+    if form["input_type"] == "boolean":
+        return value == "Yes"
+    if form["input_type"] == "date":
+        return value.isoformat()
+    if isinstance(value, str):
+        return value.strip() or None
+    return value
+
+
+def _answer_text(answer):
+    if answer is None:
+        return "_Skipped_"
+    if isinstance(answer, bool):
+        return "Yes" if answer else "No"
+    return str(answer)
+
+
+def _render_answers(message):
+    with st.container():
+        for step in message.get("answers", []):
+            st.caption(f"{step['question']} - {step['answer']}")
+
+
+def _conversation_history():
+    history = []
+    for message in st.session_state["messages"]:
+        if message.get("pending"):
+            continue
+        for step in message.get("answers", []):
+            history.append({"role": "assistant", "content": step["question"]})
+            history.append({"role": "user", "content": step["answer"]})
+        history.append({"role": message["role"], "content": message["content"]})
+    return history
+
+
+def render_form(message):
+    """One question from the agent, rendered as a single native input. Submitting resumes the agent."""
+    form = message["form"]
+    pending_id = form["pending_id"]
+    kind = form["input_type"]
+    label = "Your answer" if form["required"] else "Your answer (optional)"
+    widget_key = f"answer_{pending_id}"
+
+    with st.form(f"ask_{pending_id}", border=True):
+        if kind == "choice":
+            value = st.selectbox(
+                label, [""] + form["options"], format_func=lambda o: o or "Select an option", key=widget_key
+            )
+        elif kind == "number":
+            value = st.number_input(label, value=None, key=widget_key)
+        elif kind == "boolean":
+            value = st.radio(label, ["Yes", "No"], index=None, horizontal=True, key=widget_key)
+        elif kind == "date":
+            value = st.date_input(label, value=None, key=widget_key)
+        else:
+            value = st.text_input(label, key=widget_key)
+        submitted = st.form_submit_button("Submit", type="primary")
+        cancelled = st.form_submit_button("Cancel")
+
+    if cancelled:
+        message.pop("form", None)
+        message["status"] = ("Cancelled", "complete")
+        message["content"] += "\n\n*Cancelled.*"
+        st.rerun()
+    if submitted:
+        answer = _form_answer(form, value)
+        if answer is None and form["required"]:
+            st.warning("This question needs an answer.")
+            return
+        message.setdefault("answers", []).append(
+            {"question": form["question"], "answer": _answer_text(answer)}
+        )
+        message.pop("form", None)
+        message["content"] = ""
+        message["pending"] = True
+        message["resume"] = {"pending_id": pending_id, "answer": answer}
+        st.rerun()
 
 
 # The input is at page level so Streamlit pins it to the bottom of the screen.
-prompt = st.chat_input("Ask anything about your boards, sprints, or work items...")
+prompt = st.chat_input(
+    "Ask anything about your boards, sprints, or work items...",
+    disabled=any(message.get("pending") or message.get("form") for message in st.session_state["messages"]),
+)
 
 if prompt:
-    history = [
-        {"role": m["role"], "content": m["content"]}
-        for m in st.session_state["messages"]
-        if not m.get("pending")
-    ]
+    history = _conversation_history()
     st.session_state["messages"].append({"role": "user", "content": prompt})
     st.session_state["messages"].append(
         {"role": "assistant", "content": "", "pending": True, "question": prompt, "history": history}
@@ -242,22 +337,15 @@ def render_conversation():
                 continue
 
             started = time.monotonic()
-            status = st.status("Thinking...", expanded=False)
+            status = st.status("Continuing..." if "resume" in message else "Thinking...", expanded=False)
+            _render_answers(message)
             answer_box = st.empty()
             text = ""
             finished = False
             last_draw = 0.0
             try:
-                with httpx.stream(
-                    "POST",
-                    f"{BACKEND_URL}/agent/chat/stream",
-                    json={
-                        "session_id": SESSION_ID,
-                        "message": message["question"],
-                        "history": message["history"],
-                    },
-                    timeout=120.0,
-                ) as resp:
+                url, payload = _request_for(message)
+                with httpx.stream("POST", url, json=payload, timeout=120.0) as resp:
                     if resp.status_code != 200:
                         resp.read()
                         message["content"] = f"Query failed: {resp.text}"
@@ -281,6 +369,12 @@ def render_conversation():
                                 answer_box.empty()
                             elif kind == "status":
                                 status.update(label=event.get("message", "Working..."))
+                            elif kind == "ask":
+                                message["form"] = event
+                                message["content"] = event.get("question", "")
+                                message["status"] = ("Waiting for your answer", "complete")
+                                status.update(label="Waiting for your answer", state="complete")
+                                finished = True
                             elif kind == "done":
                                 message["content"] = event.get("answer", "")
                                 message["trace"] = event.get("execution_trace", [])
@@ -305,6 +399,8 @@ def render_conversation():
             message.pop("pending", None)
             message.pop("question", None)
             message.pop("history", None)
+            message.pop("resume", None)
+            st.rerun()
 
 
 chat_slot = st.empty()
