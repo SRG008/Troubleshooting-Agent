@@ -39,6 +39,12 @@ if "action" in query_params:
     if action_val == "connected":
         st.session_state["trigger_toast"] = ("Successfully connected to Jira workspace via OAuth!", "🎉")
         st.session_state["refresh_status"] = True
+    elif action_val == "github_connected":
+        st.session_state["trigger_toast"] = ("Connected to GitHub organization.", "🐙")
+        st.session_state["refresh_status"] = True
+    elif action_val == "github_failed":
+        reason = query_params.get("reason", "unknown error")
+        st.session_state["trigger_toast"] = (f"GitHub connection failed: {reason}", "⚠️")
     st.query_params.clear()
 
 
@@ -64,6 +70,13 @@ def fetch_cloud_status():
         return None
 
 
+def fetch_github_status():
+    try:
+        return _get_status("/auth/github/status")
+    except Exception:
+        return None
+
+
 def refresh_status_cache():
     _get_status.clear()
 
@@ -72,6 +85,7 @@ if st.session_state.pop("refresh_status", False):
     refresh_status_cache()
 status_data = fetch_connection_status()
 cloud_status = fetch_cloud_status()
+github_status = fetch_github_status()
 
 if "trigger_toast" in st.session_state:
     msg, icon = st.session_state["trigger_toast"]
@@ -136,6 +150,36 @@ with st.sidebar:
                             st.rerun()
                         else:
                             st.error(f"Failed: {resp.text}")
+
+    st.divider()
+
+    # --- GITHUB CONNECTION ---
+    st.markdown("#### 🐙 GitHub Repositories")
+    if github_status and github_status.get("connected"):
+        st.success("🟢 Connected")
+        st.caption(f"Signed in as `{github_status.get('login')}` in `{github_status.get('organization')}`")
+        repos = github_status.get("repositories", [])
+        with st.expander(f"Repositories you can access ({len(repos)})"):
+            if not repos:
+                st.caption("No repositories in this organization are accessible to your account.")
+            for repo in repos:
+                lock = " 🔒" if repo["private"] else ""
+                st.markdown(f"- [{repo['full_name']}]({repo['html_url']}){lock}")
+        if st.button("Disconnect GitHub", type="secondary", use_container_width=True):
+            httpx.post(f"{BACKEND_URL}/auth/github/disconnect", params={"session_id": SESSION_ID}, timeout=5.0)
+            st.toast("Disconnected GitHub.", icon="🔌")
+            refresh_status_cache()
+            st.rerun()
+    else:
+        st.warning("🔴 Disconnected")
+        github_login_url = f"{BACKEND_URL}/auth/github/login?session_id={SESSION_ID}"
+        st.markdown(f"""
+            <div style="text-align: center; margin-top: 8px; margin-bottom: 8px;">
+                <a href="{github_login_url}" target="_self" style="display: block; width: 100%; background-color: #24292F; color: white; padding: 9px 12px; text-decoration: none; border-radius: 6px; font-weight: bold; font-size: 13px; box-sizing: border-box;">
+                    🐙 Connect GitHub
+                </a>
+            </div>
+        """, unsafe_allow_html=True)
 
     st.divider()
 

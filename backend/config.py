@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     jira_client_secret: str = ""
     jira_redirect_uri: str = "http://localhost:8000/auth/jira/callback"
 
+    github_client_id: str = ""
+    github_client_secret: str = ""
+    github_redirect_uri: str = "http://localhost:8000/auth/github/callback"
+    github_organization: str = ""
+
     backend_url: str = "http://localhost:8000"
     frontend_url: str = "http://localhost:8501"
 

@@ -1,7 +1,9 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+import httpx
 import json
+import urllib.parse
 from typing import Optional
 from backend.config import settings
 from backend.models import (
@@ -17,6 +19,15 @@ from backend.auth_jira import (
     build_atlassian_oauth_url,
     exchange_code_and_resolve_cloud_id,
     connect_via_pat,
+)
+from backend.auth_github import (
+    GitHubConnectionError,
+    GitHubStatus,
+    build_github_oauth_url,
+    complete_github_connection,
+    disconnect_github,
+    discard_oauth_state,
+    get_github_status,
 )
 from backend.jira_service import JiraClientService
 from backend.agent import answer_question, stream_answer, resume_answer
@@ -89,6 +100,49 @@ async def jira_connect_pat(
     req: PATConnectRequest, session_id: str = Query(default="default-engineer-session")
 ):
     return await connect_via_pat(session_id=session_id, req=req)
+
+
+# ---------------- GITHUB ENDPOINTS ----------------
+@app.get("/auth/github/status", response_model=GitHubStatus)
+async def get_github_connection_status(session_id: str = Query(default="default-engineer-session")):
+    return get_github_status(session_id)
+
+
+@app.post("/auth/github/disconnect", response_model=GitHubStatus)
+async def github_disconnect(session_id: str = Query(default="default-engineer-session")):
+    return disconnect_github(session_id)
+
+
+@app.get("/auth/github/login")
+async def github_oauth_login(session_id: str = Query(default="default-engineer-session")):
+    try:
+        auth_url = build_github_oauth_url(session_id)
+    except GitHubConnectionError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return RedirectResponse(url=auth_url)
+
+
+@app.get("/auth/github/callback")
+async def github_oauth_callback(
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+    error_description: Optional[str] = None,
+):
+    if error or not code or not state:
+        if state:
+            discard_oauth_state(state)
+        reason = error_description or error or "GitHub did not return an authorization code."
+    else:
+        try:
+            await complete_github_connection(code=code, state=state)
+            return RedirectResponse(url=f"{settings.frontend_url}?action=github_connected")
+        except GitHubConnectionError as e:
+            reason = str(e)
+        except httpx.HTTPError:
+            reason = "Could not reach GitHub. Try again."
+    query = urllib.parse.urlencode({"action": "github_failed", "reason": reason})
+    return RedirectResponse(url=f"{settings.frontend_url}?{query}")
 
 
 @app.get("/jira/projects")
