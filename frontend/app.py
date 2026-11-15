@@ -2,9 +2,23 @@ import streamlit as st
 import httpx
 import json
 import time
+import uuid
 
 BACKEND_URL = "http://127.0.0.1:8000"
-SESSION_ID = "default-engineer-session"
+SESSION_COOKIE_NAME = "troubleshooting_session"
+
+
+def _resolve_session_id() -> str:
+    """Per-browser session ID: the cookie set by the backend after login, else a per-tab ID until login."""
+    cookie_id = st.context.cookies.get(SESSION_COOKIE_NAME)
+    if cookie_id:
+        return cookie_id
+    if "browser_session_id" not in st.session_state:
+        st.session_state["browser_session_id"] = uuid.uuid4().hex
+    return st.session_state["browser_session_id"]
+
+
+SESSION_ID = _resolve_session_id()
 
 st.set_page_config(
     page_title="Agentic Ops | Autonomous Production Troubleshooter",
@@ -38,10 +52,8 @@ if "action" in query_params:
     action_val = query_params["action"]
     if action_val == "connected":
         st.session_state["trigger_toast"] = ("Successfully connected to Jira workspace via OAuth!", "🎉")
-        st.session_state["refresh_status"] = True
     elif action_val == "github_connected":
-        st.session_state["trigger_toast"] = ("Connected to GitHub organization.", "🐙")
-        st.session_state["refresh_status"] = True
+        st.session_state["github_callback_pending"] = True
     elif action_val == "github_failed":
         reason = query_params.get("reason", "unknown error")
         st.session_state["trigger_toast"] = (f"GitHub connection failed: {reason}", "⚠️")
@@ -49,30 +61,34 @@ if "action" in query_params:
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def _get_status(path):
+def _get_status(path, session_id):
     # Raises on failure so that failed responses are not cached.
-    r = httpx.get(f"{BACKEND_URL}{path}", params={"session_id": SESSION_ID}, timeout=5.0)
+    # session_id is part of the cache key so one browser never reuses another browser's status.
+    r = httpx.get(f"{BACKEND_URL}{path}", params={"session_id": session_id}, timeout=5.0)
     r.raise_for_status()
     return r.json()
 
 
 def fetch_connection_status():
     try:
-        return _get_status("/auth/jira/status")
+        return _get_status("/auth/jira/status", SESSION_ID)
     except Exception:
         return None
 
 
 def fetch_cloud_status():
     try:
-        return _get_status("/cloud/status")
+        return _get_status("/cloud/status", SESSION_ID)
     except Exception:
         return None
 
 
 def fetch_github_status():
+    # Not cached: a "disconnected" result cached before the OAuth callback would hide the new connection for up to the TTL.
     try:
-        return _get_status("/auth/github/status")
+        r = httpx.get(f"{BACKEND_URL}/auth/github/status", params={"session_id": SESSION_ID}, timeout=5.0)
+        r.raise_for_status()
+        return r.json()
     except Exception:
         return None
 
@@ -81,11 +97,49 @@ def refresh_status_cache():
     _get_status.clear()
 
 
-if st.session_state.pop("refresh_status", False):
+def save_github_selection():
+    chosen = st.session_state.get("github_repo_selection", [])
+    try:
+        resp = httpx.put(
+            f"{BACKEND_URL}/auth/github/selection",
+            params={"session_id": SESSION_ID},
+            json={"repositories": chosen},
+            timeout=10.0,
+        )
+        if resp.status_code == 400:
+            st.session_state["trigger_toast"] = (resp.json().get("detail", "Could not save repositories."), "⚠️")
+        else:
+            resp.raise_for_status()
+    except httpx.HTTPError:
+        st.session_state["trigger_toast"] = ("Could not save repository selection. Is the backend running?", "⚠️")
     refresh_status_cache()
+
+
+def browse_folder_into(widget_key: str):
+    try:
+        resp = httpx.get(f"{BACKEND_URL}/folders/browse", timeout=300.0)
+        resp.raise_for_status()
+    except httpx.HTTPError:
+        st.session_state["trigger_toast"] = ("Could not open the folder picker. Is the backend running?", "⚠️")
+        return
+    folder = resp.json().get("folder", "")
+    if folder:
+        st.session_state[widget_key] = folder
+
+
 status_data = fetch_connection_status()
 cloud_status = fetch_cloud_status()
 github_status = fetch_github_status()
+
+# Confirm the GitHub callback against the backend before claiming success.
+if st.session_state.pop("github_callback_pending", False):
+    if github_status and github_status.get("connected"):
+        st.session_state["trigger_toast"] = ("Connected to GitHub organization.", "🐙")
+    else:
+        st.session_state["trigger_toast"] = (
+            "GitHub authorized, but this browser is not linked to the connection. Refresh the page or connect again.",
+            "⚠️",
+        )
 
 if "trigger_toast" in st.session_state:
     msg, icon = st.session_state["trigger_toast"]
@@ -165,6 +219,21 @@ with st.sidebar:
             for repo in repos:
                 lock = " 🔒" if repo["private"] else ""
                 st.markdown(f"- [{repo['full_name']}]({repo['html_url']}){lock}")
+        repo_options = [repo["full_name"] for repo in repos]
+        if "github_repo_selection" not in st.session_state:
+            st.session_state["github_repo_selection"] = [
+                name for name in github_status.get("selected_repositories", []) if name in repo_options
+            ]
+        st.session_state["github_repo_selection"] = [
+            name for name in st.session_state["github_repo_selection"] if name in repo_options
+        ]
+        st.multiselect(
+            "Repositories the assistant may work in",
+            options=repo_options,
+            key="github_repo_selection",
+            on_change=save_github_selection,
+            help="Only these repositories can be read, changed, or raised as pull requests.",
+        )
         if st.button("Disconnect GitHub", type="secondary", use_container_width=True):
             httpx.post(f"{BACKEND_URL}/auth/github/disconnect", params={"session_id": SESSION_ID}, timeout=5.0)
             st.toast("Disconnected GitHub.", icon="🔌")
@@ -323,8 +392,18 @@ def render_form(message):
     label = "Your answer" if form["required"] else "Your answer (optional)"
     widget_key = f"answer_{pending_id}"
 
+    if kind == "folder":
+        st.button(
+            "Browse for folder", key=f"browse_{pending_id}", on_click=browse_folder_into, args=(widget_key,),
+        )
+
+    if form.get("details"):
+        st.markdown(form["details"])
+
     with st.form(f"ask_{pending_id}", border=True):
-        if kind == "choice":
+        if kind == "choice" and len(form["options"]) == 2:
+            value = st.radio(label, form["options"], index=None, horizontal=True, key=widget_key)
+        elif kind == "choice":
             value = st.selectbox(
                 label, [""] + form["options"], format_func=lambda o: o or "Select an option", key=widget_key
             )
@@ -336,6 +415,10 @@ def render_form(message):
             value = st.date_input(label, value=None, key=widget_key)
         else:
             value = st.text_input(label, key=widget_key)
+        if kind == "choice" and form.get("allow_other"):
+            typed = st.text_input("Or type your own", key=f"{widget_key}_other")
+            if typed.strip():
+                value = typed.strip()
         submitted = st.form_submit_button("Submit", type="primary")
         cancelled = st.form_submit_button("Cancel")
 

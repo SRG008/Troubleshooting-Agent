@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import RedirectResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
+import asyncio
 import json
 import urllib.parse
 from typing import Optional
@@ -22,14 +23,18 @@ from backend.auth_jira import (
 )
 from backend.auth_github import (
     GitHubConnectionError,
+    GitHubSelectionRequest,
     GitHubStatus,
     build_github_oauth_url,
     complete_github_connection,
     disconnect_github,
     discard_oauth_state,
     get_github_status,
+    set_selected_repositories,
 )
+from backend.github_workspace import pick_folder
 from backend.jira_service import JiraClientService
+from backend.session_cookie import redirect_with_session
 from backend.agent import answer_question, stream_answer, resume_answer
 from backend.cloud_connector import (
     CloudSessionState,
@@ -76,7 +81,7 @@ async def jira_oauth_login(session_id: str = Query(default="default-engineer-ses
 @app.get("/auth/jira/callback")
 async def jira_oauth_callback(code: str, state: str = "default-engineer-session"):
     await exchange_code_and_resolve_cloud_id(code=code, session_id=state)
-    return RedirectResponse(url=f"{settings.frontend_url}?action=connected")
+    return redirect_with_session(f"{settings.frontend_url}?action=connected", state)
 
 
 @app.post("/auth/jira/switch-site", response_model=JiraSessionState)
@@ -113,6 +118,16 @@ async def github_disconnect(session_id: str = Query(default="default-engineer-se
     return disconnect_github(session_id)
 
 
+@app.put("/auth/github/selection", response_model=GitHubStatus)
+async def github_select_repositories(
+    req: GitHubSelectionRequest, session_id: str = Query(default="default-engineer-session")
+):
+    try:
+        return set_selected_repositories(session_id, req.repositories)
+    except GitHubConnectionError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @app.get("/auth/github/login")
 async def github_oauth_login(session_id: str = Query(default="default-engineer-session")):
     try:
@@ -120,6 +135,15 @@ async def github_oauth_login(session_id: str = Query(default="default-engineer-s
     except GitHubConnectionError as e:
         raise HTTPException(status_code=400, detail=str(e))
     return RedirectResponse(url=auth_url)
+
+
+@app.get("/folders/browse")
+async def browse_local_folder():
+    try:
+        folder = await asyncio.to_thread(pick_folder)
+    except GitHubConnectionError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    return {"folder": folder}
 
 
 @app.get("/auth/github/callback")
@@ -135,8 +159,8 @@ async def github_oauth_callback(
         reason = error_description or error or "GitHub did not return an authorization code."
     else:
         try:
-            await complete_github_connection(code=code, state=state)
-            return RedirectResponse(url=f"{settings.frontend_url}?action=github_connected")
+            session_id = await complete_github_connection(code=code, state=state)
+            return redirect_with_session(f"{settings.frontend_url}?action=github_connected", session_id)
         except GitHubConnectionError as e:
             reason = str(e)
         except httpx.HTTPError:

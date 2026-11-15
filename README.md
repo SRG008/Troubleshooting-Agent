@@ -32,6 +32,13 @@ To add a provider, implement `LLMProvider.generate` in a new module under `backe
 
 The agent, tool declarations, LLM layer, and chat endpoint need no changes.
 
+### GitHub repositories
+- Connect GitHub from the sidebar. Sign-in uses a GitHub OAuth app and is limited to `GITHUB_ORGANIZATION` members. Tokens stay on the server and are tied to a per-browser session cookie (30 days).
+- Select the repositories the agent may use in the sidebar. The agent refuses any other repository.
+- For each selected repository, set its local folder in the sidebar: type the path or click Browse to pick it, then Save. The folder can be an existing clone of the repository, or a parent folder the repository is cloned into. The agent never picks a location itself; if no folder is set, it asks for one in chat.
+- Tools in `backend/github_tools.py`: list repositories and branches, read and search files, write files, show changes, discard a file, and commit and open a pull request.
+- Commits are authored as the connected GitHub user. The agent asks for the base branch every time and commits only after the user confirms.
+
 ## Quickstart Guide
 1. Copy `.env.example` to `.env`. Set at least one LLM key (`GEMINI_API_KEY`, `OPENAI_API_KEY`, or `ANTHROPIC_API_KEY`) and, optionally, `LLM_CHAIN` (for example `gemini:gemini-flash-lite-latest,openai:gpt-4o-mini`). Add the Atlassian OAuth credentials as well.
 2. Create a virtual environment and install dependencies:

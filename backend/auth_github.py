@@ -1,12 +1,18 @@
+import json
+import logging
 import secrets
 import urllib.parse
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import httpx
+from cryptography.fernet import Fernet, InvalidToken
 from pydantic import BaseModel, Field
 
 from backend.config import settings
+
+logger = logging.getLogger(__name__)
 
 GITHUB_WEB_URL = "https://github.com"
 GITHUB_API_URL = "https://api.github.com"
@@ -31,6 +37,12 @@ class GitHubStatus(BaseModel):
     login: Optional[str] = None
     organization: Optional[str] = None
     repositories: List[GitHubRepository] = Field(default_factory=list)
+    selected_repositories: List[str] = Field(default_factory=list)
+    local_folders: Dict[str, str] = Field(default_factory=dict)
+
+
+class GitHubSelectionRequest(BaseModel):
+    repositories: List[str] = Field(default_factory=list)
 
 
 @dataclass
@@ -38,12 +50,68 @@ class _GitHubConnection:
     # The token stays server-side and is never returned by the status endpoint.
     access_token: str
     login: str
+    user_id: int = 0
     repositories: List[GitHubRepository] = field(default_factory=list)
+    selected: List[str] = field(default_factory=list)
+    # full_name -> local checkout path that the user or agent prepared for this repo.
+    checkouts: Dict[str, str] = field(default_factory=dict)
 
 
 # In-memory stores (Replace with Redis in multi-worker production), like auth_jira.py.
 GITHUB_SESSION_STORE: Dict[str, _GitHubConnection] = {}
 PENDING_OAUTH_STATES: Dict[str, str] = {}  # OAuth state -> session_id
+
+# Connections are also saved encrypted on disk so backend restarts and auto-reloads keep them.
+GITHUB_STATE_DIR = Path(__file__).resolve().parent.parent / "data" / "github"
+GITHUB_KEY_FILE = GITHUB_STATE_DIR / "store.key"
+GITHUB_STORE_FILE = GITHUB_STATE_DIR / "connections.enc"
+
+
+def _fernet() -> Fernet:
+    GITHUB_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if not GITHUB_KEY_FILE.exists():
+        GITHUB_KEY_FILE.write_bytes(Fernet.generate_key())
+    return Fernet(GITHUB_KEY_FILE.read_bytes())
+
+
+def save_github_store() -> None:
+    payload = {
+        session_id: {
+            "access_token": connection.access_token,
+            "login": connection.login,
+            "user_id": connection.user_id,
+            "repositories": [repo.model_dump() for repo in connection.repositories],
+            "selected": connection.selected,
+            "checkouts": connection.checkouts,
+        }
+        for session_id, connection in GITHUB_SESSION_STORE.items()
+    }
+    encrypted = _fernet().encrypt(json.dumps(payload).encode("utf-8"))
+    temp_file = GITHUB_STORE_FILE.with_suffix(".tmp")
+    temp_file.write_bytes(encrypted)
+    temp_file.replace(GITHUB_STORE_FILE)
+
+
+def _load_github_store() -> None:
+    if not GITHUB_STORE_FILE.exists():
+        return
+    try:
+        payload = json.loads(_fernet().decrypt(GITHUB_STORE_FILE.read_bytes()))
+    except (InvalidToken, ValueError, OSError):
+        logger.warning("Saved GitHub connections could not be read; users must connect GitHub again.")
+        return
+    for session_id, data in payload.items():
+        GITHUB_SESSION_STORE[session_id] = _GitHubConnection(
+            access_token=data["access_token"],
+            login=data["login"],
+            user_id=data.get("user_id", 0),
+            repositories=[GitHubRepository(**repo) for repo in data.get("repositories", [])],
+            selected=data.get("selected", []),
+            checkouts=data.get("checkouts", {}),
+        )
+
+
+_load_github_store()
 
 
 def _http_client() -> httpx.AsyncClient:
@@ -73,11 +141,31 @@ def get_github_status(session_id: str) -> GitHubStatus:
         login=connection.login,
         organization=settings.github_organization,
         repositories=connection.repositories,
+        selected_repositories=list(connection.selected),
+        local_folders=dict(connection.checkouts),
     )
+
+
+def get_github_connection(session_id: str) -> Optional[_GitHubConnection]:
+    return GITHUB_SESSION_STORE.get(session_id)
+
+
+def set_selected_repositories(session_id: str, full_names: List[str]) -> GitHubStatus:
+    connection = GITHUB_SESSION_STORE.get(session_id)
+    if connection is None:
+        raise GitHubConnectionError("Connect GitHub first.")
+    available = {repo.full_name for repo in connection.repositories}
+    unknown = [name for name in full_names if name not in available]
+    if unknown:
+        raise GitHubConnectionError(f"Not accessible to your account: {', '.join(unknown)}")
+    connection.selected = list(dict.fromkeys(full_names))
+    save_github_store()
+    return get_github_status(session_id)
 
 
 def disconnect_github(session_id: str) -> GitHubStatus:
     GITHUB_SESSION_STORE.pop(session_id, None)
+    save_github_store()
     return GitHubStatus()
 
 
@@ -107,11 +195,14 @@ async def complete_github_connection(code: str, state: str) -> str:
 
     async with _http_client() as client:
         token = await _exchange_code(client, code)
-        login = await _fetch_login(client, token)
+        login, user_id = await _fetch_user(client, token)
         await _require_membership(client, token, login)
         repositories = await _fetch_organization_repositories(client, token)
 
-    GITHUB_SESSION_STORE[session_id] = _GitHubConnection(access_token=token, login=login, repositories=repositories)
+    GITHUB_SESSION_STORE[session_id] = _GitHubConnection(
+        access_token=token, login=login, user_id=user_id, repositories=repositories
+    )
+    save_github_store()
     return session_id
 
 
@@ -147,11 +238,12 @@ def _describe_api_error(resp: httpx.Response) -> str:
     return f"GitHub API returned HTTP {resp.status_code}."
 
 
-async def _fetch_login(client: httpx.AsyncClient, token: str) -> str:
+async def _fetch_user(client: httpx.AsyncClient, token: str) -> Tuple[str, int]:
     resp = await _github_get(client, token, "/user")
     if resp.status_code != 200:
         raise GitHubConnectionError(_describe_api_error(resp))
-    return resp.json()["login"]
+    body = resp.json()
+    return body["login"], int(body.get("id") or 0)
 
 
 async def _require_membership(client: httpx.AsyncClient, token: str, login: str) -> None:
@@ -198,3 +290,70 @@ async def _fetch_organization_repositories(client: httpx.AsyncClient, token: str
         if len(batch) < 100:
             return repositories
         page += 1
+
+
+def require_selected_repository(session_id: str, full_name: str) -> _GitHubConnection:
+    """Returns the session's connection when the repository is selected for the assistant, otherwise raises."""
+    connection = GITHUB_SESSION_STORE.get(session_id)
+    if connection is None:
+        raise GitHubConnectionError("GitHub is not connected.")
+    if full_name not in connection.selected:
+        raise GitHubConnectionError(f"{full_name} is not selected in the sidebar.")
+    return connection
+
+
+async def list_branch_names(session_id: str, full_name: str) -> List[str]:
+    connection = require_selected_repository(session_id, full_name)
+    async with _http_client() as client:
+        resp = await _github_get(
+            client, connection.access_token, f"/repos/{full_name}/branches", params={"per_page": 100}
+        )
+    if resp.status_code != 200:
+        raise GitHubConnectionError(_describe_api_error(resp))
+    return [branch["name"] for branch in resp.json()]
+
+
+async def list_pull_requests(session_id: str, full_name: str, state: str = "open") -> List[Dict]:
+    connection = require_selected_repository(session_id, full_name)
+    async with _http_client() as client:
+        resp = await _github_get(
+            client,
+            connection.access_token,
+            f"/repos/{full_name}/pulls",
+            params={"state": state, "per_page": 30, "sort": "updated", "direction": "desc"},
+        )
+    if resp.status_code != 200:
+        raise GitHubConnectionError(_describe_api_error(resp))
+    return [
+        {
+            "number": pr["number"],
+            "title": pr["title"],
+            "state": pr["state"],
+            "author": (pr.get("user") or {}).get("login", ""),
+            "head": pr["head"]["ref"],
+            "base": pr["base"]["ref"],
+            "created_at": pr["created_at"],
+            "url": pr["html_url"],
+        }
+        for pr in resp.json()
+    ]
+
+
+async def open_pull_request(session_id: str, full_name: str, head: str, base: str, title: str, body: str) -> Dict:
+    connection = require_selected_repository(session_id, full_name)
+    async with _http_client() as client:
+        resp = await client.post(
+            f"{GITHUB_API_URL}/repos/{full_name}/pulls",
+            json={"title": title, "head": head, "base": base, "body": body},
+            headers={"Authorization": f"Bearer {connection.access_token}"},
+        )
+    if resp.status_code not in (200, 201):
+        try:
+            detail = resp.json()
+            reasons = [detail.get("message") or ""] + [e.get("message", "") for e in detail.get("errors", [])]
+            message = "; ".join(r for r in reasons if r)
+        except ValueError:
+            message = ""
+        raise GitHubConnectionError(f"GitHub did not open the pull request: {message or resp.status_code}")
+    created = resp.json()
+    return {"number": created["number"], "url": created["html_url"]}

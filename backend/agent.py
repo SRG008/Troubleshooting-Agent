@@ -1,11 +1,14 @@
 import asyncio
 import json
+import logging
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple
 
+from backend.auth_github import get_github_connection
+from backend.github_tools import GITHUB_TOOL_SPECS, build_github_handlers
 from backend.llm import (
     AssistantMessage,
     LLMResponse,
@@ -21,13 +24,15 @@ from backend.models import AgentStepTrace, ChatResponse, ChatTurn
 from backend.trackers.base import IssueTracker
 from backend.trackers.registry import get_active_tracker
 
-MAX_TOOL_ROUNDS = 6
+logger = logging.getLogger(__name__)
+
+MAX_TOOL_ROUNDS = 15
 MAX_HISTORY_TURNS = 10
 MAX_TOOL_RESULT_CHARS = 15000
 METADATA_TTL_SECONDS = 300.0
 PENDING_ASK_TTL_SECONDS = 1800.0
 ASK_TOOL = "ask_user"
-ASK_INPUT_TYPES = {"choice", "text", "number", "date", "boolean"}
+ASK_INPUT_TYPES = {"choice", "text", "number", "date", "boolean", "folder"}
 
 _metadata_cache: Dict[Tuple[str, str, str], Tuple[float, Any]] = {}
 
@@ -124,13 +129,29 @@ TOOL_SPECS: List[ToolSpec] = [
                 "question": {"type": "string", "description": "The question, written for the user."},
                 "input_type": {
                     "type": "string",
-                    "enum": ["choice", "text", "number", "date", "boolean"],
-                    "description": "How the user answers. Use choice for a fixed set of options.",
+                    "enum": ["choice", "text", "number", "date", "boolean", "folder"],
+                    "description": (
+                        "How the user answers. Use choice for a fixed set of options. "
+                        "Use folder for a folder on this machine; the user picks it with a Browse button."
+                    ),
                 },
                 "options": {
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "Options for input_type choice. Use the real names returned by tools.",
+                },
+                "allow_other": {
+                    "type": "boolean",
+                    "description": (
+                        "For input_type choice only: true lets the user type an answer that is not in the options."
+                    ),
+                },
+                "details": {
+                    "type": "string",
+                    "description": (
+                        "Optional Markdown shown above the question, for example a fenced diff the user must review "
+                        "before answering."
+                    ),
                 },
                 "required": {
                     "type": "boolean",
@@ -203,15 +224,64 @@ TOOL_SPECS: List[ToolSpec] = [
 ]
 
 
-def _build_system_prompt(tracker: Optional[IssueTracker]) -> str:
+ASK_TOOL_SPEC = next(spec for spec in TOOL_SPECS if spec.name == ASK_TOOL)
+
+
+def _build_system_prompt(tracker: Optional[IssueTracker], github: Optional[Tuple[str, List[str]]] = None) -> str:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    if tracker is None:
-        return f"""You are an AI assistant for issue tracking. Current date and time: {today}.
+    parts = [_tracker_prompt(tracker, today) if tracker else _no_tracker_prompt(today)]
+    if github is not None:
+        parts.append(_github_prompt(*github))
+    return "\n".join(parts)
+
+
+def _no_tracker_prompt(today: str) -> str:
+    return f"""You are an AI assistant for issue tracking. Current date and time: {today}.
 
 No issue tracker is connected right now, so you cannot query any workspace. Answer general questions directly from general knowledge.
 If the user asks about their workspace (projects, boards, sprints, work items, counts, or details), tell them to connect their workspace in the sidebar first. Never invent workspace data.
 Answer in clear Markdown.
 """
+
+
+def _github_prompt(login: str, repositories: List[str]) -> str:
+    selected = ", ".join(repositories)
+    return f"""
+GitHub is connected as "{login}". The user selected these repositories for you: {selected}.
+Only use these repositories. Never read, change, or open a pull request in any other repository.
+
+Repository tools: list_repositories, use_local_clone, list_branches, list_pull_requests, list_repo_files, get_repo_file, search_repo_code, get_repo_history, write_repo_file, get_repo_changes, discard_repo_file, commit_and_open_pr.
+- Before you read or change a selected repository, call list_repositories and check its local_folder. If local_folder is null, ask in chat, one question per turn: first ask_user with input_type boolean, asking whether that repository (use its full name) is already cloned on this machine. If yes, ask_user with input_type folder for the folder of the existing clone. If no, ask_user with input_type folder for the parent folder to clone it into. Then call use_local_clone with the folder the user chose. Never choose a folder yourself and never guess a path.
+- Ask ONE question per turn with ask_user, then wait for the answer.
+- If a repository tool returns an error, show the exact error message to the user and stop. Do not answer as if the tool succeeded, and do not guess what the repository contains.
+- To describe a repository's files, call list_repo_files and report only the names it returns.
+- For questions about pull requests, call list_pull_requests and report each pull request's number, title, author, branches, and link. If it returns none, say there are no matching pull requests.
+- For questions about commits, history, or activity (for example how many commits there are), call get_repo_history and report its commit_count, then list the latest commits with each commit's short sha, author, date, and message. If no tool can answer a question, say so plainly instead of guessing.
+
+Fixing a bug or building a feature:
+1. Identify the task. If the user asks to fix an issue or build a feature without giving a task or bug ID, ask for the ID (ask_user, text). If the user already gave an ID in the message, do not ask for it again. When a work item tool is available, read the item with get_work_item to understand the request.
+2. If more than one repository is selected and the request does not name one, ask which repository (ask_user, choice).
+3. Analyze the code: search_repo_code and get_repo_file. Read every file you need before you change it. Never guess file contents.
+4. Make the smallest correct change with write_repo_file. Do not change unrelated code.
+5. Call get_repo_changes. Explain the problem and its cause, then show each changed file with its diff in a fenced diff code block, and say what changed and why.
+6. For each changed file, show its diff in the chat (fenced diff block) and ask whether to keep or discard it (ask_user, choice with options "Keep" and "Discard"). Put that file's diff in the details field of ask_user, so the user sees the change while answering. Call discard_repo_file for each discarded file.
+7. Ask whether to commit and open a pull request (ask_user, boolean).
+8. If yes, ask which base branch the pull request should target (ask_user, choice; options come from list_branches). Always ask the base branch, every time, even if there is only one.
+9. Only after the user explicitly confirmed in step 7 and chose the base branch in step 8, call commit_and_open_pr with a short new branch name, a commit message, a pull request title, and a description. Report the pull request link.
+
+Creating a new project or a new file set in a repository (for example "create a new project"):
+- Before writing any file, the request must state everything needed to build it. Check the request for each of these: kind of application, language, framework or tool, version, name, location, and features. Ask ask_user about every item the user did not state explicitly, one question per turn, and keep asking until nothing is missing. Use choice when you can list the options, otherwise text. For a language, framework, or tool question, list the main well-known options for that kind of application (about 10 to 15, not just a few) and set allow_other to true so the user can type any other choice. Never fill a gap with your own default, and never assume something because the repository already uses it unless the user confirms it.
+- Ask the location as a folder choice, never as a free-text path. First ask_user with input_type boolean: is the project already in a folder on this machine? If yes, ask_user with input_type folder for that existing project folder. If no, ask_user with input_type folder for the parent folder to clone the repository into, then call use_local_clone with that folder and create the project inside the clone. Never choose a folder yourself and never guess a path.
+- Ask the remaining questions based on the location option the user chose. For an existing folder, do not ask again for anything the user already said, and ask only what is still missing. For a new project, ask every remaining item.
+- When you have enough answers, call list_repo_files and get_repo_file for any existing files that the new code must match. Then write every new file in one turn with parallel write_repo_file calls, instead of one file per turn.
+- Then continue with steps 5 to 9 above.
+
+Never commit, push, or open a pull request without the explicit confirmation from step 7 in this conversation.
+Answers about a repository must be based on tool results. Answer in clear Markdown.
+"""
+
+
+def _tracker_prompt(tracker: IssueTracker, today: str) -> str:
     return f"""You are an AI assistant for issue tracking, connected to the {tracker.name} workspace "{tracker.workspace_name}".
 Current date and time: {today}.
 
@@ -347,7 +417,8 @@ async def _run_tool(
             raise ValueError(f"Unknown tool '{call.name}'.")
         return call, await handler(call.args), "SUCCESS"
     except Exception as e:
-        return call, {"error": str(e)}, "FAILED"
+        logger.exception("Tool %s failed", call.name)
+        return call, {"error": str(e) or type(e).__name__}, "FAILED"
 
 
 def _llm_details(resp: LLMResponse) -> str:
@@ -359,10 +430,27 @@ def _llm_details(resp: LLMResponse) -> str:
 
 def _context(session_id: str):
     tracker = get_active_tracker(session_id)
-    handlers = _build_handlers(tracker, session_id) if tracker else {}
-    tools = TOOL_SPECS if tracker else []
-    provider_name = tracker.name if tracker else "general"
-    return tracker, handlers, tools, provider_name, _build_system_prompt(tracker)
+    connection = get_github_connection(session_id)
+    github = (connection.login, sorted(connection.selected)) if connection and connection.selected else None
+
+    handlers: Dict[str, Callable[[Dict[str, Any]], Awaitable[Any]]] = {}
+    tools: List[ToolSpec] = []
+    if tracker:
+        handlers.update(_build_handlers(tracker, session_id))
+        tools.extend(TOOL_SPECS)
+    if github:
+        handlers.update(build_github_handlers(session_id))
+        if not tracker:
+            tools.append(ASK_TOOL_SPEC)
+        tools.extend(GITHUB_TOOL_SPECS)
+
+    if tracker:
+        provider_name = tracker.name
+    elif github:
+        provider_name = "GitHub"
+    else:
+        provider_name = "general"
+    return tracker, handlers, tools, provider_name, _build_system_prompt(tracker, github)
 
 
 def _ask_event(call: ToolCall, pending_id: str) -> Dict[str, Any]:
@@ -377,8 +465,10 @@ def _ask_event(call: ToolCall, pending_id: str) -> Dict[str, Any]:
         "type": "ask",
         "pending_id": pending_id,
         "question": str(args.get("question") or "Please provide more information."),
+        "details": str(args.get("details") or ""),
         "input_type": input_type,
         "options": options if input_type == "choice" else [],
+        "allow_other": input_type == "choice" and args.get("allow_other") is True,
         "required": args.get("required") is not False,
     }
 
@@ -459,6 +549,16 @@ async def _run_loop(
                     )
                 )
                 messages.append(ToolResultMessage(call_id=call.id, name=call.name, content=_tool_content(result)))
+            if all(status == "FAILED" for _, _, status in outcomes):
+                # Retrying the same failing call only burns the tool-call budget, so report the error now.
+                errors = " | ".join(str(result.get("error", result)) for _, result, _ in outcomes)
+                yield {
+                    "type": "done",
+                    "answer": f"The {provider_name} request failed: {errors}",
+                    "provider": provider_name,
+                    "execution_trace": trace,
+                }
+                return
 
         if ask_calls:
             # Pause here: the answer comes back through resume_answer, which appends the tool result.
@@ -515,7 +615,7 @@ async def resume_answer(session_id: str, pending_id: str, answer: Any) -> AsyncI
         return
 
     tracker, handlers, tools, provider_name, system_prompt = _context(session_id)
-    if tracker is None:
+    if not handlers:
         yield {
             "type": "done",
             "answer": "The workspace was disconnected before your answer was used. Connect it again and retry.",
