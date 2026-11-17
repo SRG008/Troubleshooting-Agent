@@ -12,13 +12,15 @@ from backend.auth_github import (
 )
 from backend.github_workspace import (
     commit_and_push,
+    create_branch,
     discard_file,
     ensure_checkout,
-    list_files,
-    read_file,
+    find_previous_clone,
+    list_repo_files,
+    read_repo_file,
     repo_changes,
     repo_history,
-    search_code,
+    search_repo_code,
     set_local_folder,
     write_file,
 )
@@ -51,6 +53,14 @@ GITHUB_TOOL_SPECS: List[ToolSpec] = [
         },
     ),
     ToolSpec(
+        name="find_previous_clone",
+        description=(
+            "Check whether a selected repository was already cloned on this machine before, in any chat. Returns the "
+            "folder, or null. Call it when the user says the repository is not cloned yet, before cloning again."
+        ),
+        parameters={"type": "object", "properties": {"repository": _REPOSITORY}, "required": ["repository"]},
+    ),
+    ToolSpec(
         name="list_branches",
         description="List the branches of a selected repository, for choosing the base branch of a pull request.",
         parameters={"type": "object", "properties": {"repository": _REPOSITORY}, "required": ["repository"]},
@@ -73,35 +83,51 @@ GITHUB_TOOL_SPECS: List[ToolSpec] = [
     ToolSpec(
         name="list_repo_files",
         description=(
-            "List the tracked files of a selected repository, optionally under one directory. Use it before naming "
-            "any file; never guess file names."
+            "List the files of a selected repository on GitHub, optionally under one directory. Uses the default "
+            "branch unless a branch is given. Returns branch, total_files, the file names, and whether the list is "
+            "truncated. No local clone is needed. Use it for file counts and before naming any file; never guess file names."
         ),
         parameters={
             "type": "object",
             "properties": {
                 "repository": _REPOSITORY,
                 "directory": {"type": "string", "description": "Optional directory relative to the repository root."},
+                "branch": {"type": "string", "description": "Optional branch name. Defaults to the default branch."},
             },
             "required": ["repository"],
         },
     ),
     ToolSpec(
         name="get_repo_file",
-        description="Read a text file from a selected repository. The repository is cloned on first use.",
+        description=(
+            "Read a text file of a selected repository from GitHub, on the default branch or the given branch. "
+            "No local clone is needed."
+        ),
         parameters={
             "type": "object",
-            "properties": {"repository": _REPOSITORY, "path": _PATH},
+            "properties": {
+                "repository": _REPOSITORY,
+                "path": _PATH,
+                "branch": {"type": "string", "description": "Optional branch name. Defaults to the default branch."},
+            },
             "required": ["repository", "path"],
         },
     ),
     ToolSpec(
         name="search_repo_code",
-        description="Search the code of a selected repository with a regular expression. Returns file, line and text.",
+        description=(
+            "Search the code of a selected repository on GitHub for a keyword or phrase. Returns the matching file "
+            "paths; read them with get_repo_file to see the lines. Only the default branch is searched. No local clone is needed."
+        ),
         parameters={
             "type": "object",
             "properties": {
                 "repository": _REPOSITORY,
-                "pattern": {"type": "string", "description": "Regular expression to search for."},
+                "pattern": {"type": "string", "description": "Keyword or phrase to search for."},
+                "branch": {
+                    "type": "string",
+                    "description": "Optional branch name. Only the default branch can be searched.",
+                },
             },
             "required": ["repository", "pattern"],
         },
@@ -109,8 +135,8 @@ GITHUB_TOOL_SPECS: List[ToolSpec] = [
     ToolSpec(
         name="write_repo_file",
         description=(
-            "Create or replace a text file in a selected repository with its full new content. The change stays "
-            "local until the user approves a commit."
+            "Create or replace a text file in a selected repository with its full new content. Needs a local clone "
+            "(see the clone question in the instructions). The change stays local until the user approves a commit."
         ),
         parameters={
             "type": "object",
@@ -140,7 +166,7 @@ GITHUB_TOOL_SPECS: List[ToolSpec] = [
     ),
     ToolSpec(
         name="get_repo_changes",
-        description="List every file changed locally in a selected repository, with its diff, for the user to review.",
+        description="List every file changed locally in a selected repository, with its status (added, modified, deleted). The user sees each file's code before and after the change when you ask keep or discard.",
         parameters={"type": "object", "properties": {"repository": _REPOSITORY}, "required": ["repository"]},
     ),
     ToolSpec(
@@ -153,16 +179,33 @@ GITHUB_TOOL_SPECS: List[ToolSpec] = [
         },
     ),
     ToolSpec(
-        name="commit_and_open_pr",
+        name="create_repo_branch",
         description=(
-            "Create a branch from the chosen base branch, commit all kept local changes as the user, push the branch, "
-            "and open a pull request. Call only after the user explicitly confirmed the commit and chose the base branch."
+            "Create a new local branch in a selected repository and switch to it, before any file is changed. "
+            "Call only after the user chose to create a branch and gave its name."
         ),
         parameters={
             "type": "object",
             "properties": {
                 "repository": _REPOSITORY,
                 "branch": {"type": "string", "description": "New branch name, for example fix/KAN-12-login-error."},
+            },
+            "required": ["repository", "branch"],
+        },
+    ),
+    ToolSpec(
+        name="commit_and_open_pr",
+        description=(
+            "Commit all kept local changes as the user, push the branch, and open a pull request. If the branch is "
+            "already checked out (created with create_repo_branch), it is committed on that branch; otherwise it is "
+            "created from the chosen base branch. Call only after the user explicitly confirmed the commit and chose "
+            "the base branch."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "repository": _REPOSITORY,
+                "branch": {"type": "string", "description": "Branch name, the same as the one created earlier if any."},
                 "base": {"type": "string", "description": "Base branch the pull request targets."},
                 "commit_message": {"type": "string", "description": "Commit message."},
                 "pr_title": {"type": "string", "description": "Pull request title."},
@@ -201,6 +244,10 @@ def build_github_handlers(session_id: str) -> Dict[str, Handler]:
         path = await set_local_folder(session_id, required(args, "repository"), required(args, "folder"))
         return {"checkout": str(path)}
 
+    async def previous_clone(args: Dict[str, Any]) -> Any:
+        path = await find_previous_clone(required(args, "repository"))
+        return {"checkout": str(path) if path else None}
+
     async def branches(args: Dict[str, Any]) -> Any:
         return {"branches": await list_branch_names(session_id, required(args, "repository"))}
 
@@ -211,17 +258,23 @@ def build_github_handlers(session_id: str) -> Dict[str, Handler]:
         return {"pull_requests": await list_pull_requests(session_id, required(args, "repository"), state)}
 
     async def files(args: Dict[str, Any]) -> Any:
-        _, path = await checkout(args)
-        return {"files": await list_files(path, str(args.get("directory") or ""))}
+        return await list_repo_files(
+            session_id,
+            required(args, "repository"),
+            str(args.get("directory") or ""),
+            str(args.get("branch") or ""),
+        )
 
     async def get_file(args: Dict[str, Any]) -> Any:
-        _, path = await checkout(args)
+        repository = required(args, "repository")
         relative = required(args, "path")
-        return {"path": relative, "content": read_file(path, relative)}
+        branch = str(args.get("branch") or "")
+        return {"path": relative, "content": await read_repo_file(session_id, repository, relative, branch)}
 
     async def search(args: Dict[str, Any]) -> Any:
-        _, path = await checkout(args)
-        return {"matches": await search_code(path, required(args, "pattern"))}
+        return await search_repo_code(
+            session_id, required(args, "repository"), required(args, "pattern"), str(args.get("branch") or "")
+        )
 
     async def write(args: Dict[str, Any]) -> Any:
         _, path = await checkout(args)
@@ -235,13 +288,17 @@ def build_github_handlers(session_id: str) -> Dict[str, Handler]:
         )
 
     async def changes(args: Dict[str, Any]) -> Any:
-        return {"changes": await repo_changes(session_id, required(args, "repository"))}
+        return {"changes": [{"path": c["path"], "status": c["status"]} for c in await repo_changes(session_id, required(args, "repository"))]}
 
     async def discard(args: Dict[str, Any]) -> Any:
         _, path = await checkout(args)
         relative = required(args, "path")
         await discard_file(path, relative)
         return {"discarded": relative}
+
+    async def create_branch_handler(args: Dict[str, Any]) -> Any:
+        repository = required(args, "repository")
+        return {"branch": await create_branch(session_id, repository, required(args, "branch"))}
 
     async def commit_pr(args: Dict[str, Any]) -> Any:
         repository = required(args, "repository")
@@ -272,6 +329,7 @@ def build_github_handlers(session_id: str) -> Dict[str, Handler]:
     return {
         "list_repositories": list_repositories,
         "use_local_clone": use_clone,
+        "find_previous_clone": previous_clone,
         "list_branches": branches,
         "list_pull_requests": pull_requests,
         "list_repo_files": files,
@@ -281,5 +339,6 @@ def build_github_handlers(session_id: str) -> Dict[str, Handler]:
         "write_repo_file": write,
         "get_repo_changes": changes,
         "discard_repo_file": discard,
+        "create_repo_branch": create_branch_handler,
         "commit_and_open_pr": commit_pr,
     }

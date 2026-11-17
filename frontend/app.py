@@ -4,6 +4,8 @@ import json
 import time
 import uuid
 
+from code_view import render_side_by_side, render_snippet
+
 BACKEND_URL = "http://127.0.0.1:8000"
 SESSION_COOKIE_NAME = "troubleshooting_session"
 
@@ -399,6 +401,13 @@ def render_form(message):
 
     if form.get("details"):
         st.markdown(form["details"])
+    review = form.get("review")
+    if review and review["status"] == "added":
+        render_snippet(review["new"], review["path"])
+    elif review:
+        render_side_by_side(review["path"], review["status"], review["old"] or "", review["new"])
+    elif form.get("code"):
+        render_snippet(form["code"], form.get("code_language") or "text")
 
     with st.form(f"ask_{pending_id}", border=True):
         if kind == "choice" and len(form["options"]) == 2:

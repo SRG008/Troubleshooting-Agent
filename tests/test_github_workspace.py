@@ -3,10 +3,12 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import httpx
 
 from backend import github_tools, github_workspace
-from backend.auth_github import GITHUB_SESSION_STORE, GitHubConnectionError, _GitHubConnection
+from backend.auth_github import GITHUB_CLONE_REGISTRY, GITHUB_SESSION_STORE, GitHubConnectionError, _GitHubConnection
 
 
 class ResolveInsideTests(unittest.TestCase):
@@ -22,20 +24,6 @@ class ResolveInsideTests(unittest.TestCase):
         self.assertEqual(resolved, checkout / "src" / "app" / "main.py")
 
 
-class ListFilesTests(unittest.TestCase):
-    def test_lists_tracked_files_under_a_directory_only(self):
-        repo = Path(tempfile.mkdtemp()).resolve()
-        subprocess.run(["git", "init", "-q", str(repo)], check=True)
-        (repo / "src").mkdir()
-        (repo / "README.md").write_text("x\n", encoding="utf-8")
-        (repo / "src" / "app.py").write_text("x\n", encoding="utf-8")
-        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
-        everything = asyncio.run(github_workspace.list_files(repo))
-        self.assertEqual(everything.splitlines(), ["README.md", "src/app.py"])
-        under_src = asyncio.run(github_workspace.list_files(repo, "src"))
-        self.assertEqual(under_src.splitlines(), ["src/app.py"])
-
-
 class LocalFolderTests(unittest.TestCase):
     def setUp(self):
         # Keeps test connections out of the real encrypted store in data/github/.
@@ -43,12 +31,46 @@ class LocalFolderTests(unittest.TestCase):
         save_patch.start()
         self.addCleanup(save_patch.stop)
         GITHUB_SESSION_STORE.clear()
+        GITHUB_CLONE_REGISTRY.clear()
         GITHUB_SESSION_STORE["session-1"] = _GitHubConnection(
             access_token="token", login="alice", user_id=7, selected=["acme/api"]
         )
 
+    def test_previous_clone_from_an_earlier_chat_is_reused_without_cloning(self):
+        clone = Path(tempfile.mkdtemp()).resolve() / "api"
+        subprocess.run(["git", "init", "-q", str(clone)], check=True)
+        subprocess.run(
+            ["git", "-C", str(clone), "remote", "add", "origin", "https://github.com/acme/api.git"], check=True
+        )
+        GITHUB_CLONE_REGISTRY["acme/api"] = str(clone)
+        empty_parent = Path(tempfile.mkdtemp()).resolve()
+        with patch.object(github_workspace, "_clone") as clone_mock:
+            path = asyncio.run(github_workspace.set_local_folder("session-1", "acme/api", str(empty_parent)))
+        self.assertEqual(path, clone)
+        clone_mock.assert_not_called()
+
+    def test_find_previous_clone_is_none_when_never_cloned(self):
+        self.assertIsNone(asyncio.run(github_workspace.find_previous_clone("acme/api")))
+
+    def test_finds_clone_beside_another_registered_clone(self):
+        parent = Path(tempfile.mkdtemp()).resolve()
+        other = parent / "other"
+        clone = parent / "api"
+        for folder, repo in ((other, "acme/other"), (clone, "acme/api")):
+            subprocess.run(["git", "init", "-q", str(folder)], check=True)
+            subprocess.run(
+                ["git", "-C", str(folder), "remote", "add", "origin", f"https://github.com/{repo}.git"], check=True
+            )
+        GITHUB_CLONE_REGISTRY["acme/other"] = str(other)
+        self.assertEqual(asyncio.run(github_workspace.find_previous_clone("acme/api")), clone)
+
+    def test_missing_saved_checkout_is_reported_instead_of_used(self):
+        GITHUB_SESSION_STORE["session-1"].checkouts["acme/api"] = str(Path(tempfile.mkdtemp()) / "gone")
+        with self.assertRaises(GitHubConnectionError):
+            asyncio.run(github_workspace.ensure_checkout("session-1", "acme/api"))
+
     def test_refuses_to_guess_a_folder_when_none_is_set(self):
-        with self.assertRaisesRegex(GitHubConnectionError, "No local folder is set for acme/api"):
+        with self.assertRaisesRegex(GitHubConnectionError, "No local clone of acme/api is available"):
             asyncio.run(github_workspace.ensure_checkout("session-1", "acme/api"))
 
     def test_parent_folder_with_existing_clone_resolves_to_that_clone(self):
@@ -61,6 +83,31 @@ class LocalFolderTests(unittest.TestCase):
         path = asyncio.run(github_workspace.set_local_folder("session-1", "acme/api", str(parent)))
         self.assertEqual(path, clone)
         self.assertEqual(asyncio.run(github_workspace.ensure_checkout("session-1", "acme/api")), clone)
+
+    def test_existing_clone_in_chosen_parent_is_reused_without_cloning(self):
+        parent = Path(tempfile.mkdtemp()).resolve()
+        clone = parent / "NexEdge"
+        subprocess.run(["git", "init", "-q", str(clone)], check=True)
+        subprocess.run(
+            ["git", "-C", str(clone), "remote", "add", "origin", "https://github.com/acme/api.git"], check=True
+        )
+        with patch.object(github_workspace, "_clone") as clone_mock:
+            path = asyncio.run(github_workspace.set_local_folder("session-1", "acme/api", str(parent)))
+        self.assertEqual(path, clone)
+        clone_mock.assert_not_called()
+
+    def test_known_checkout_is_reused_and_never_cloned_again(self):
+        known = Path(tempfile.mkdtemp()).resolve() / "api"
+        subprocess.run(["git", "init", "-q", str(known)], check=True)
+        subprocess.run(
+            ["git", "-C", str(known), "remote", "add", "origin", "https://github.com/acme/api.git"], check=True
+        )
+        GITHUB_SESSION_STORE["session-1"].checkouts["acme/api"] = str(known)
+        empty_parent = Path(tempfile.mkdtemp()).resolve()
+        with patch.object(github_workspace, "_clone") as clone_mock:
+            path = asyncio.run(github_workspace.set_local_folder("session-1", "acme/api", str(empty_parent)))
+        self.assertEqual(path, known)
+        clone_mock.assert_not_called()
 
     def test_failed_clone_leaves_no_partial_folder_and_reports_the_error(self):
         parent = Path(tempfile.mkdtemp()).resolve()
@@ -115,39 +162,127 @@ class DiscardFileTests(unittest.TestCase):
         self.assertFalse((self.repo / "new.txt").exists())
 
 
-class RepoHistoryTests(unittest.TestCase):
+class ReviewDiffTests(unittest.TestCase):
     def setUp(self):
+        GITHUB_SESSION_STORE.clear()
         self.repo = Path(tempfile.mkdtemp()).resolve()
-        self._git("init", "-q")
-        self._git("config", "user.email", "test@example.com")
-        self._git("config", "user.name", "Test")
-        for number in range(3):
-            (self.repo / "file.txt").write_text(f"{number}\n", encoding="utf-8")
-            self._git("add", "file.txt")
-            self._git("commit", "-q", "-m", f"commit {number}")
-        self._git("update-ref", "refs/remotes/origin/main", "HEAD")
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "config", "user.email", "t@example.com"], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "config", "user.name", "T"], check=True)
+        (self.repo / "Program.cs").write_text("class A {\n    void M() {}\n}\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.repo), "commit", "-q", "-m", "init"], check=True)
+        (self.repo / "Program.cs").write_text("class A {\n    void M() { Run(); }\n}\n", encoding="utf-8")
+        GITHUB_SESSION_STORE["session-1"] = _GitHubConnection(
+            access_token="token", login="alice", user_id=7, selected=["acme/api"],
+            checkouts={"acme/api": str(self.repo)},
+        )
 
-    def _git(self, *args):
-        subprocess.run(["git", *args], cwd=self.repo, check=True, capture_output=True)
+    def tearDown(self):
+        GITHUB_SESSION_STORE.clear()
 
-    def test_counts_commits_of_remote_branch_and_lists_latest(self):
-        original_git = github_workspace._git
+    def test_question_naming_a_changed_file_gets_its_before_and_after_code(self):
+        (self.repo / "New.cs").write_text("class New {}\n", encoding="utf-8")
+        changes = asyncio.run(github_workspace.repo_changes("session-1", "acme/api"))
+        self.assertEqual({c["path"]: c["status"] for c in changes}, {"Program.cs": "modified", "New.cs": "added"})
+        review = github_workspace.review_for_question("session-1", "Keep or discard Program.cs?")
+        self.assertEqual(review["old"], "class A {\n    void M() {}\n}\n")
+        self.assertIn("void M() { Run(); }", review["new"])
+        self.assertEqual(review["language"], "csharp")
+        self.assertIsNone(github_workspace.review_for_question("session-1", "What is the app name?"))
+        self.assertIsNone(github_workspace.review_for_question("session-1", "Keep or discard New.cs?")["old"])
 
-        async def git_without_network(args, cwd=None, token=None):
-            if args[:1] == ["fetch"]:
-                return ""
-            return await original_git(args, cwd=cwd, token=token)
 
-        async def checkout(session_id, full_name):
-            return self.repo
+class RepoFilesFromGitHubTests(unittest.TestCase):
+    def setUp(self):
+        GITHUB_SESSION_STORE.clear()
+        GITHUB_SESSION_STORE["session-1"] = _GitHubConnection(
+            access_token="token", login="alice", user_id=7, selected=["acme/api"]
+        )
 
-        connection = _GitHubConnection(access_token="token", login="octo", user_id=1, repositories=[])
-        with patch.object(github_workspace, "require_selected_repository", return_value=connection), patch.object(
-            github_workspace, "ensure_checkout", side_effect=checkout
-        ), patch.object(github_workspace, "_git", side_effect=git_without_network):
-            result = asyncio.run(github_workspace.repo_history("session", "octo/repo", branch="main", limit=2))
-        self.assertEqual(result["commit_count"], 3)
-        self.assertEqual([c["message"] for c in result["recent_commits"]], ["commit 2", "commit 1"])
+    def tearDown(self):
+        GITHUB_SESSION_STORE.clear()
+
+    def test_counts_and_filters_default_branch_files_without_a_clone(self):
+        def responses():
+            return [
+                httpx.Response(200, json={"default_branch": "main"}),
+                httpx.Response(
+                    200,
+                    json={
+                        "truncated": False,
+                        "tree": [
+                            {"path": "README.md", "type": "blob"},
+                            {"path": "src", "type": "tree"},
+                            {"path": "src/app.py", "type": "blob"},
+                        ],
+                    },
+                ),
+            ]
+
+        with patch.object(github_workspace, "_github_request", side_effect=responses()):
+            everything = asyncio.run(github_workspace.list_repo_files("session-1", "acme/api"))
+        self.assertEqual(everything["branch"], "main")
+        self.assertEqual(everything["total_files"], 2)
+        self.assertEqual(everything["files"], ["README.md", "src/app.py"])
+
+        with patch.object(github_workspace, "_github_request", side_effect=responses()):
+            under_src = asyncio.run(github_workspace.list_repo_files("session-1", "acme/api", "src"))
+        self.assertEqual(under_src["files"], ["src/app.py"])
+
+    def test_lists_the_given_branch_without_asking_for_the_default(self):
+        tree = httpx.Response(200, json={"tree": [{"path": "dev.txt", "type": "blob"}]})
+        with patch.object(github_workspace, "_github_request", return_value=tree) as request:
+            result = asyncio.run(github_workspace.list_repo_files("session-1", "acme/api", branch="feature/x"))
+        self.assertEqual(result["branch"], "feature/x")
+        self.assertEqual(result["files"], ["dev.txt"])
+        self.assertEqual(request.call_count, 1)
+
+    def test_rejected_token_drops_the_connection_and_asks_to_reconnect(self):
+        client = MagicMock()
+        client.__aenter__ = AsyncMock(return_value=client)
+        client.__aexit__ = AsyncMock(return_value=False)
+        client.get = AsyncMock(return_value=httpx.Response(401, json={"message": "Bad credentials"}))
+        with patch.object(github_workspace, "_http_client", return_value=client), patch.object(
+            github_workspace, "save_github_store"
+        ):
+            with self.assertRaisesRegex(GitHubConnectionError, "Connect GitHub again"):
+                asyncio.run(github_workspace.list_repo_files("session-1", "acme/api"))
+        self.assertNotIn("session-1", GITHUB_SESSION_STORE)
+
+    def test_search_refuses_a_branch_other_than_the_default(self):
+        default = httpx.Response(200, json={"default_branch": "main"})
+        with patch.object(github_workspace, "_github_request", return_value=default):
+            with self.assertRaises(GitHubConnectionError):
+                asyncio.run(github_workspace.search_repo_code("session-1", "acme/api", "login", branch="dev"))
+
+
+class RepoHistoryFromGitHubTests(unittest.TestCase):
+    def test_counts_commits_from_the_last_page_and_lists_latest(self):
+        latest = httpx.Response(
+            200,
+            json=[
+                {
+                    "sha": "abcdef123456",
+                    "commit": {
+                        "author": {"name": "Ann", "date": "2026-01-02T10:00:00Z"},
+                        "message": "Fix login\n\nlonger body",
+                    },
+                }
+            ],
+        )
+        counted = httpx.Response(
+            200,
+            json=[{"sha": "abcdef123456"}],
+            headers={"Link": '<https://api.github.com/repositories/1/commits?per_page=1&page=2>; rel="next", '
+                             '<https://api.github.com/repositories/1/commits?per_page=1&page=42>; rel="last"'},
+        )
+        with patch.object(github_workspace, "_github_request", side_effect=[latest, counted]):
+            result = asyncio.run(github_workspace.repo_history("session", "acme/api", limit=1))
+        self.assertEqual(result["commit_count"], 42)
+        self.assertEqual(
+            result["recent_commits"], [{"sha": "abcdef1", "author": "Ann", "date": "2026-01-02", "message": "Fix login"}]
+        )
 
 
 class CommitAndPushTests(unittest.TestCase):
@@ -194,6 +329,19 @@ class CommitAndPushTests(unittest.TestCase):
         self._git(self.checkout, "fetch", "-q", "origin")
         author = self._git(self.checkout, "log", "-1", "--format=%an <%ae>", "origin/fix/KAN-1-login").strip()
         self.assertEqual(author, "alice <7+alice@users.noreply.github.com>")
+
+    def test_commits_on_a_branch_created_earlier_without_recreating_it(self):
+        asyncio.run(github_workspace.create_branch("session-1", "acme/api", "feat/NEX-2-health"))
+        (self.checkout / "app.py").write_text("print('health')\n", encoding="utf-8")
+        asyncio.run(
+            github_workspace.commit_and_push(
+                "session-1", "acme/api", branch="feat/NEX-2-health", base="main",
+                message="Add health", author_login="alice", author_id=7,
+            )
+        )
+        self.assertEqual(self._git(self.checkout, "rev-parse", "--abbrev-ref", "HEAD").strip(), "feat/NEX-2-health")
+        remote_heads = self._git(self.checkout, "ls-remote", "--heads", str(self.remote), "feat/NEX-2-health")
+        self.assertIn("refs/heads/feat/NEX-2-health", remote_heads)
 
     def test_refuses_to_commit_when_nothing_changed(self):
         with self.assertRaises(GitHubConnectionError):

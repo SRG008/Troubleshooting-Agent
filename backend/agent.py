@@ -9,6 +9,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional
 
 from backend.auth_github import get_github_connection
 from backend.github_tools import GITHUB_TOOL_SPECS, build_github_handlers
+from backend.github_workspace import review_for_question
 from backend.llm import (
     AssistantMessage,
     LLMResponse,
@@ -149,9 +150,20 @@ TOOL_SPECS: List[ToolSpec] = [
                 "details": {
                     "type": "string",
                     "description": (
-                        "Optional Markdown shown above the question, for example a fenced diff the user must review "
-                        "before answering."
+                        "Optional Markdown shown above the question, for example the explanation of a change "
+                        "the user must review before answering."
                     ),
+                },
+                "code": {
+                    "type": "string",
+                    "description": (
+                        "Optional code shown in a code viewer with a copy button, for example the exact diff of a file. "
+                        "Use the exact text from the tool result, with its line breaks and indentation."
+                    ),
+                },
+                "code_language": {
+                    "type": "string",
+                    "description": "Language of code for highlighting, for example diff, csharp, python or json.",
                 },
                 "required": {
                     "type": "boolean",
@@ -250,11 +262,12 @@ def _github_prompt(login: str, repositories: List[str]) -> str:
 GitHub is connected as "{login}". The user selected these repositories for you: {selected}.
 Only use these repositories. Never read, change, or open a pull request in any other repository.
 
-Repository tools: list_repositories, use_local_clone, list_branches, list_pull_requests, list_repo_files, get_repo_file, search_repo_code, get_repo_history, write_repo_file, get_repo_changes, discard_repo_file, commit_and_open_pr.
-- Before you read or change a selected repository, call list_repositories and check its local_folder. If local_folder is null, ask in chat, one question per turn: first ask_user with input_type boolean, asking whether that repository (use its full name) is already cloned on this machine. If yes, ask_user with input_type folder for the folder of the existing clone. If no, ask_user with input_type folder for the parent folder to clone it into. Then call use_local_clone with the folder the user chose. Never choose a folder yourself and never guess a path.
+Repository tools: list_repositories, use_local_clone, find_previous_clone, list_branches, list_pull_requests, list_repo_files, get_repo_file, search_repo_code, get_repo_history, write_repo_file, get_repo_changes, discard_repo_file, create_repo_branch, commit_and_open_pr.
+- Reading never needs a local clone. list_repo_files, get_repo_file, search_repo_code, get_repo_history, list_branches and list_pull_requests read GitHub directly, so answer those without asking about a clone.
+- Before any change tool (write_repo_file, create_repo_branch, get_repo_changes, discard_repo_file, commit_and_open_pr), call list_repositories and check local_folder. If it is set, use it as is and never ask about the location again. If it is null, ask in chat, one question per turn: first ask_user with input_type boolean, asking whether that repository (use its full name) is already cloned on this machine. If yes, ask_user with input_type folder for the folder of the existing clone, then call use_local_clone with it. If no, call find_previous_clone. If it returns a checkout, tell the user the repository was already cloned previously at that folder and call use_local_clone with it. If it returns null, ask_user with input_type folder for the parent folder to clone it into, then call use_local_clone with that folder. Never choose a folder yourself and never guess a path.
 - Ask ONE question per turn with ask_user, then wait for the answer.
 - If a repository tool returns an error, show the exact error message to the user and stop. Do not answer as if the tool succeeded, and do not guess what the repository contains.
-- To describe a repository's files, call list_repo_files and report only the names it returns.
+- To describe a repository's files, call list_repo_files and report its total_files; list only the names it returns, and say so if truncated. Pass the branch when the user names one, for list_repo_files and get_repo_file.
 - For questions about pull requests, call list_pull_requests and report each pull request's number, title, author, branches, and link. If it returns none, say there are no matching pull requests.
 - For questions about commits, history, or activity (for example how many commits there are), call get_repo_history and report its commit_count, then list the latest commits with each commit's short sha, author, date, and message. If no tool can answer a question, say so plainly instead of guessing.
 
@@ -262,22 +275,22 @@ Fixing a bug or building a feature:
 1. Identify the task. If the user asks to fix an issue or build a feature without giving a task or bug ID, ask for the ID (ask_user, text). If the user already gave an ID in the message, do not ask for it again. When a work item tool is available, read the item with get_work_item to understand the request.
 2. If more than one repository is selected and the request does not name one, ask which repository (ask_user, choice).
 3. Analyze the code: search_repo_code and get_repo_file. Read every file you need before you change it. Never guess file contents.
-4. Make the smallest correct change with write_repo_file. Do not change unrelated code.
-5. Call get_repo_changes. Explain the problem and its cause, then show each changed file with its diff in a fenced diff code block, and say what changed and why.
-6. For each changed file, show its diff in the chat (fenced diff block) and ask whether to keep or discard it (ask_user, choice with options "Keep" and "Discard"). Put that file's diff in the details field of ask_user, so the user sees the change while answering. Call discard_repo_file for each discarded file.
+4. Before changing any file, ask whether to create a new branch for this work (ask_user, boolean). If yes, ask for the branch name (ask_user, text) and call create_repo_branch with it. Then make the smallest correct change with write_repo_file on the current branch. Do not change unrelated code. Before the first of these change calls, make sure the repository has a local clone, as described above.
+5. Call get_repo_changes. Explain the problem and its cause in chat.
+6. For each changed file, ask whether to keep or discard it (ask_user, choice with options "Keep" and "Discard"). Do not copy the code into the code field; the app shows each file's code before and after the change automatically. Put the explanation of what changed and why in the details field. Call discard_repo_file for each discarded file.
 7. Ask whether to commit and open a pull request (ask_user, boolean).
 8. If yes, ask which base branch the pull request should target (ask_user, choice; options come from list_branches). Always ask the base branch, every time, even if there is only one.
-9. Only after the user explicitly confirmed in step 7 and chose the base branch in step 8, call commit_and_open_pr with a short new branch name, a commit message, a pull request title, and a description. Report the pull request link.
+9. Only after the user explicitly confirmed in step 7 and chose the base branch in step 8, call commit_and_open_pr with the branch name (the one created in step 4, or a short new name if none was created), a commit message, a pull request title, and a description. Report the pull request link.
 
 Creating a new project or a new file set in a repository (for example "create a new project"):
 - Before writing any file, the request must state everything needed to build it. Check the request for each of these: kind of application, language, framework or tool, version, name, location, and features. Ask ask_user about every item the user did not state explicitly, one question per turn, and keep asking until nothing is missing. Use choice when you can list the options, otherwise text. For a language, framework, or tool question, list the main well-known options for that kind of application (about 10 to 15, not just a few) and set allow_other to true so the user can type any other choice. Never fill a gap with your own default, and never assume something because the repository already uses it unless the user confirms it.
-- Ask the location as a folder choice, never as a free-text path. First ask_user with input_type boolean: is the project already in a folder on this machine? If yes, ask_user with input_type folder for that existing project folder. If no, ask_user with input_type folder for the parent folder to clone the repository into, then call use_local_clone with that folder and create the project inside the clone. Never choose a folder yourself and never guess a path.
-- Ask the remaining questions based on the location option the user chose. For an existing folder, do not ask again for anything the user already said, and ask only what is still missing. For a new project, ask every remaining item.
-- When you have enough answers, call list_repo_files and get_repo_file for any existing files that the new code must match. Then write every new file in one turn with parallel write_repo_file calls, instead of one file per turn.
+- The location is asked as a folder choice, never as a free-text path, and only through the clone rule above. When local_folder is already set, create the project inside that folder without asking.
+- Ask the remaining questions based on the location option the user chose. For an existing folder, do not ask again for anything the user already said, and ask only what is still missing. For a new project, ask every remaining item. The location question comes right before the first write, not before the requirement questions.
+- When you have enough answers, call list_repo_files and get_repo_file for any existing files that the new code must match (these read GitHub, no clone needed). Then ensure the local clone as described above, and write every new file in one turn with parallel write_repo_file calls, instead of one file per turn.
 - Then continue with steps 5 to 9 above.
 
 Never commit, push, or open a pull request without the explicit confirmation from step 7 in this conversation.
-Answers about a repository must be based on tool results. Answer in clear Markdown.
+Answers about a repository must be based on tool results. Answer in clear Markdown. Show any code only in fenced code blocks with a language name, keeping the exact line breaks and indentation from the tool result.
 """
 
 
@@ -466,6 +479,8 @@ def _ask_event(call: ToolCall, pending_id: str) -> Dict[str, Any]:
         "pending_id": pending_id,
         "question": str(args.get("question") or "Please provide more information."),
         "details": str(args.get("details") or ""),
+        "code": str(args.get("code") or ""),
+        "code_language": str(args.get("code_language") or ""),
         "input_type": input_type,
         "options": options if input_type == "choice" else [],
         "allow_other": input_type == "choice" and args.get("allow_other") is True,
@@ -579,7 +594,12 @@ async def _run_loop(
                 call_id=ask_calls[0].id,
                 created=time.monotonic(),
             )
-            yield _ask_event(ask_calls[0], pending_id)
+            event = _ask_event(ask_calls[0], pending_id)
+            review = review_for_question(session_id, event["question"])
+            if review:
+                # The real before and after code for the file the question names, shown in the chat.
+                event["review"] = review
+            yield event
             return
 
     yield {

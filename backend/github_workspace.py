@@ -12,16 +12,27 @@ import re
 import shutil
 import subprocess
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qs, quote, urlparse
 
-from backend.auth_github import GitHubConnectionError, require_selected_repository, save_github_store
+import httpx
+
+from backend.auth_github import (
+    GITHUB_API_URL,
+    GITHUB_CLONE_REGISTRY,
+    GitHubConnectionError,
+    _describe_api_error,
+    _http_client,
+    drop_rejected_connection,
+    require_selected_repository,
+    save_github_store,
+)
 
 logger = logging.getLogger(__name__)
 MAX_LISTED_FILES = 500
 GIT_TIMEOUT_SECONDS = 120
 MAX_FILE_CHARS = 60_000
-MAX_DIFF_CHARS = 4000
 BRANCH_NAME_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,99}")
 _clone_locks: Dict[str, asyncio.Lock] = {}
 
@@ -121,27 +132,58 @@ async def _clone(connection, full_name: str, path: Path) -> None:
         raise
 
 
+async def _find_existing_clone(full_name: str, folder: Path) -> Optional[Path]:
+    """The folder itself or one of its immediate subfolders, when it is a clone of the repository."""
+    if await _origin_matches(folder, full_name):
+        return folder
+    for child in sorted(folder.iterdir()):
+        if child.is_dir() and await _origin_matches(child, full_name):
+            return child
+    return None
+
+
+async def find_previous_clone(full_name: str) -> Optional[Path]:
+    """The folder where this repository was cloned before, if it is still there.
+
+    Checks the registered clone first, then the folders next to every other registered clone, so a
+    clone made before the registry existed is still found when it sits beside a known one.
+    """
+    known = GITHUB_CLONE_REGISTRY.get(full_name)
+    if known and Path(known).is_dir() and await _origin_matches(Path(known), full_name):
+        return Path(known)
+    parents = {Path(path).parent for path in GITHUB_CLONE_REGISTRY.values() if path}
+    for parent in sorted(parents):
+        if parent.is_dir():
+            found = await _find_existing_clone(full_name, parent)
+            if found:
+                return found
+    return None
+
+
 async def set_local_folder(session_id: str, full_name: str, folder: str) -> Path:
     """Sets where a selected repository lives on this machine.
 
     The folder is either an existing clone of the repository, or a parent folder the repository
-    is cloned into (as a subfolder named after the repository).
+    is cloned into (as a subfolder named after the repository). An existing clone is reused,
+    never cloned again.
     """
     connection = require_selected_repository(session_id, full_name)
     chosen = Path(folder).expanduser().resolve()
     if not chosen.is_dir():
         raise GitHubConnectionError(f"Folder not found: {folder}")
     async with _clone_locks.setdefault(full_name, asyncio.Lock()):
-        if await _origin_matches(chosen, full_name):
-            path = chosen
-        else:
+        path = await find_previous_clone(full_name)
+        known = connection.checkouts.get(full_name)
+        if path is None and known and Path(known).is_dir():
+            path = await _find_existing_clone(full_name, Path(known))
+        path = path or await _find_existing_clone(full_name, chosen)
+        if path is None:
             path = chosen / _repo_folder_name(full_name)
             if path.exists():
-                if not await _origin_matches(path, full_name):
-                    raise GitHubConnectionError(f"{path} exists but is not a clone of {full_name}.")
-            else:
-                await _clone(connection, full_name, path)
+                raise GitHubConnectionError(f"{path} exists but is not a clone of {full_name}.")
+            await _clone(connection, full_name, path)
         connection.checkouts[full_name] = str(path)
+        GITHUB_CLONE_REGISTRY[full_name] = str(path)
         save_github_store()
         return path
 
@@ -149,21 +191,14 @@ async def set_local_folder(session_id: str, full_name: str, folder: str) -> Path
 async def ensure_checkout(session_id: str, full_name: str) -> Path:
     """Returns the local folder of a selected repository. The user must set it first."""
     connection = require_selected_repository(session_id, full_name)
-    known = connection.checkouts.get(full_name)
-    if not known:
-        raise GitHubConnectionError(
-            f"No local folder is set for {full_name}. Ask the user in chat whether it is already cloned, "
-            "then ask for the folder with ask_user and call use_local_clone."
-        )
-    return Path(known)
-
-
-def read_file(checkout: Path, relative: str) -> str:
-    target = resolve_inside(checkout, relative)
-    if not target.is_file():
-        raise GitHubConnectionError(f"No such file: {relative}")
-    text = target.read_text(encoding="utf-8", errors="replace")
-    return text[:MAX_FILE_CHARS]
+    for candidate in (connection.checkouts.get(full_name), GITHUB_CLONE_REGISTRY.get(full_name)):
+        if candidate and Path(candidate).is_dir():
+            connection.checkouts[full_name] = candidate
+            return Path(candidate)
+    raise GitHubConnectionError(
+        f"No local clone of {full_name} is available. Its saved folder is missing or is no longer a clone. "
+        "Ask the user in chat whether it is already cloned, then ask for the folder with ask_user and call use_local_clone."
+    )
 
 
 def write_file(checkout: Path, relative: str, content: str) -> None:
@@ -172,58 +207,193 @@ def write_file(checkout: Path, relative: str, content: str) -> None:
     target.write_text(content, encoding="utf-8")
 
 
-async def list_files(checkout: Path, directory: str = "") -> str:
-    """Tracked files under a directory of the checkout, so the agent reads real names instead of guessing."""
+async def _github_request(
+    session_id: str,
+    full_name: str,
+    url: str,
+    params: Optional[Dict[str, Any]] = None,
+    accept: str = "application/vnd.github+json",
+) -> httpx.Response:
+    """A GET to the GitHub API with the session's token, for a selected repository. No clone needed."""
+    connection = require_selected_repository(session_id, full_name)
+    async with _http_client() as client:
+        resp = await client.get(
+            url,
+            params=params,
+            headers={"Authorization": f"Bearer {connection.access_token}", "Accept": accept},
+        )
+    if resp.status_code == 401:
+        drop_rejected_connection(session_id)
+    return resp
+
+
+def _repo_url(full_name: str, path: str = "") -> str:
+    return f"{GITHUB_API_URL}/repos/{full_name}{path}"
+
+
+def _checked(resp: httpx.Response, what: str) -> httpx.Response:
+    if resp.status_code == 404:
+        raise GitHubConnectionError(f"Not found on GitHub: {what}")
+    if resp.status_code != 200:
+        raise GitHubConnectionError(_describe_api_error(resp))
+    return resp
+
+
+def _validate_relative(relative: str) -> None:
+    candidate = PurePosixPath(relative)
+    if not relative or candidate.is_absolute() or ".." in candidate.parts or ".git" in candidate.parts:
+        raise GitHubConnectionError(f"Invalid file path: {relative}")
+
+
+async def _default_branch(session_id: str, full_name: str) -> str:
+    repo = _checked(await _github_request(session_id, full_name, _repo_url(full_name)), full_name)
+    return repo.json()["default_branch"]
+
+
+async def list_repo_files(session_id: str, full_name: str, directory: str = "", branch: str = "") -> Dict[str, Any]:
+    """Every file of a branch (default branch when none is given) on GitHub, so counts and names are exact without a clone."""
+    if branch:
+        _validate_branch_name(branch)
+    else:
+        branch = await _default_branch(session_id, full_name)
+    tree = _checked(
+        await _github_request(session_id, full_name, _repo_url(full_name, f"/git/trees/{quote(branch, safe='')}"), {"recursive": 1}),
+        branch,
+    )
+    body = tree.json()
     prefix = ""
     if directory:
-        resolve_inside(checkout, directory)
-        prefix = directory.rstrip("/") + "/"
-    output = await _git(["ls-files", "--", prefix] if prefix else ["ls-files"], cwd=checkout)
-    files = [line for line in output.splitlines() if line]
-    return "\n".join(files[:MAX_LISTED_FILES]) + (
-        f"\n... {len(files) - MAX_LISTED_FILES} more files not shown" if len(files) > MAX_LISTED_FILES else ""
+        _validate_relative(directory)
+        prefix = directory.strip("/") + "/"
+    files = sorted(
+        item["path"] for item in body.get("tree", []) if item["type"] == "blob" and item["path"].startswith(prefix)
     )
+    return {
+        "branch": branch,
+        "total_files": len(files),
+        "files": files[:MAX_LISTED_FILES],
+        "truncated": bool(body.get("truncated")) or len(files) > MAX_LISTED_FILES,
+    }
 
 
-async def search_code(checkout: Path, pattern: str, max_lines: int = 100) -> str:
+async def read_repo_file(session_id: str, full_name: str, relative: str, branch: str = "") -> str:
+    _validate_relative(relative)
+    params: Dict[str, Any] = {}
+    if branch:
+        _validate_branch_name(branch)
+        params["ref"] = branch
+    resp = await _github_request(
+        session_id,
+        full_name,
+        _repo_url(full_name, f"/contents/{quote(relative, safe='/')}"),
+        params,
+        accept="application/vnd.github.raw+json",
+    )
+    return _checked(resp, relative).text[:MAX_FILE_CHARS]
+
+
+async def search_repo_code(session_id: str, full_name: str, pattern: str, branch: str = "") -> Dict[str, Any]:
+    """GitHub code search for a keyword in one repository. Returns matching file paths.
+
+    GitHub's code search only indexes the default branch, so another branch is refused rather than searched wrongly.
+    """
     if not pattern.strip():
         raise GitHubConnectionError("Search pattern must not be empty.")
-    output = await _git(["grep", "-n", "-I", "--no-color", "-e", pattern], cwd=checkout)
-    lines = output.splitlines()[:max_lines]
-    return "\n".join(lines)
+    if branch:
+        _validate_branch_name(branch)
+        default = await _default_branch(session_id, full_name)
+        if branch != default:
+            raise GitHubConnectionError(
+                f"GitHub code search only covers the default branch ({default}). "
+                f"For {branch}, use list_repo_files and get_repo_file instead."
+            )
+    resp = await _github_request(
+        session_id,
+        full_name,
+        f"{GITHUB_API_URL}/search/code",
+        {"q": f"{pattern} repo:{full_name}", "per_page": 30},
+    )
+    body = _checked(resp, "code search").json()
+    return {"total_count": body.get("total_count", 0), "matches": [item["path"] for item in body.get("items", [])]}
+
 
 
 async def repo_history(session_id: str, full_name: str, branch: str = "", limit: int = 10) -> Dict[str, Any]:
-    """Commit count and latest commits of a branch (default branch when none is given), as on GitHub."""
-    connection = require_selected_repository(session_id, full_name)
-    checkout = await ensure_checkout(session_id, full_name)
-    # Fetch first so the count matches GitHub rather than the last local pull.
-    await _git(["fetch", "--quiet", "--prune", "origin"], cwd=checkout, token=connection.access_token)
+    """Commit count and latest commits of a branch (default branch when none is given), straight from GitHub."""
+    limit = min(max(int(limit or 10), 1), 50)
+    branch_params: Dict[str, Any] = {}
     if branch:
         _validate_branch_name(branch)
-        ref = f"origin/{branch}"
-    else:
-        ref = "origin/HEAD"
-    limit = min(max(int(limit or 10), 1), 50)
-    count = int((await _git(["rev-list", "--count", ref], cwd=checkout)).strip())
-    log = await _git(
-        ["log", f"-n{limit}", "--date=short", "--format=%h%x09%an%x09%ad%x09%s", ref], cwd=checkout
+        branch_params["sha"] = branch
+    commits_url = _repo_url(full_name, "/commits")
+    latest = _checked(
+        await _github_request(session_id, full_name, commits_url, {**branch_params, "per_page": limit}), full_name
+    ).json()
+    counted = _checked(
+        await _github_request(session_id, full_name, commits_url, {**branch_params, "per_page": 1}), full_name
     )
-    commits = [dict(zip(("sha", "author", "date", "message"), line.split("\t", 3))) for line in log.splitlines() if line]
-    return {"ref": ref, "commit_count": count, "recent_commits": commits}
+    return {
+        "ref": branch or "default branch",
+        "commit_count": _page_count(counted),
+        "recent_commits": [
+            {
+                "sha": item["sha"][:7],
+                "author": item["commit"]["author"]["name"],
+                "date": item["commit"]["author"]["date"][:10],
+                "message": item["commit"]["message"].splitlines()[0],
+            }
+            for item in latest
+        ],
+    }
 
 
-async def repo_changes(session_id: str, full_name: str) -> List[Dict[str, str]]:
-    """Every file changed in the local checkout, with its diff, so the user can review each one."""
+def _page_count(resp: httpx.Response) -> int:
+    """Commits are counted from the last page of a one-per-page listing, the same way GitHub pages them."""
+    last = resp.links.get("last")
+    if not last:
+        return len(resp.json())
+    return int(parse_qs(urlparse(last["url"]).query)["page"][0])
+
+
+LANGUAGE_BY_SUFFIX = {
+    ".cs": "csharp", ".py": "python", ".js": "javascript", ".jsx": "jsx", ".ts": "typescript", ".tsx": "tsx",
+    ".java": "java", ".go": "go", ".rs": "rust", ".json": "json", ".md": "markdown", ".html": "html",
+    ".css": "css", ".yml": "yaml", ".yaml": "yaml", ".sql": "sql", ".xml": "xml", ".sh": "bash",
+}
+_last_reviews: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+
+async def repo_changes(session_id: str, full_name: str) -> List[Dict[str, Any]]:
+    """Every file changed in the local checkout, with its status and the text before and after the change."""
     checkout = await ensure_checkout(session_id, full_name)
-    # Intent-to-add makes new files appear in the diff.
+    # Intent-to-add makes new files show up as added in the status listing.
     await _git(["add", "--intent-to-add", "--all"], cwd=checkout)
-    names = [name for name in (await _git(["diff", "--name-only"], cwd=checkout)).splitlines() if name]
-    changes = []
-    for name in names:
-        diff = await _git(["diff", "--no-color", "--", name], cwd=checkout)
-        changes.append({"path": name, "diff": diff[:MAX_DIFF_CHARS]})
-    return changes
+    reviews = {}
+    for line in (await _git(["diff", "--name-status"], cwd=checkout)).splitlines():
+        status, _, name = line.partition("\t")
+        if not name:
+            continue
+        status = {"A": "added", "D": "deleted"}.get(status[:1], "modified")
+        old = None if status == "added" else await _git(["show", f"HEAD:{name}"], cwd=checkout)
+        target = checkout / name
+        new = target.read_text(encoding="utf-8", errors="replace") if target.is_file() else ""
+        reviews[name] = {
+            "path": name,
+            "status": status,
+            "old": old,
+            "new": new,
+            "language": LANGUAGE_BY_SUFFIX.get(PurePosixPath(name).suffix.lower(), "text"),
+        }
+    _last_reviews[session_id] = reviews
+    return list(reviews.values())
+
+
+def review_for_question(session_id: str, question: str) -> Optional[Dict[str, Any]]:
+    """The latest review of the changed file a question names, if any."""
+    for path, review in _last_reviews.get(session_id, {}).items():
+        if path in question:
+            return review
+    return None
 
 
 def _validate_branch_name(name: str) -> None:
@@ -231,12 +401,21 @@ def _validate_branch_name(name: str) -> None:
         raise GitHubConnectionError(f"Invalid branch name: {name}")
 
 
+async def create_branch(session_id: str, full_name: str, branch: str) -> str:
+    """Creates a local branch from the current HEAD and switches to it. Uncommitted changes are kept."""
+    _validate_branch_name(branch)
+    checkout = await ensure_checkout(session_id, full_name)
+    await _git(["checkout", "-b", branch], cwd=checkout)
+    return branch
+
+
 async def commit_and_push(
     session_id: str, full_name: str, branch: str, base: str, message: str, author_login: str, author_id: int
 ) -> str:
-    """Creates a branch from origin/<base>, commits every remaining local change, and pushes the branch.
+    """Commits every remaining local change on <branch> and pushes it.
 
-    Returns the commit SHA. Uses the user's GitHub identity as commit author.
+    If <branch> is not checked out yet, it is created from origin/<base> first. Returns the commit SHA.
+    Uses the user's GitHub identity as commit author.
     """
     connection = require_selected_repository(session_id, full_name)
     _validate_branch_name(branch)
@@ -247,7 +426,8 @@ async def commit_and_push(
     if not (await _git(["status", "--porcelain"], cwd=checkout)).strip():
         raise GitHubConnectionError("There are no changes to commit.")
     await _git(["fetch", "--quiet", "origin", base], cwd=checkout, token=token)
-    await _git(["checkout", "-b", branch, f"origin/{base}"], cwd=checkout)
+    if await current_branch(checkout) != branch:
+        await _git(["checkout", "-b", branch, f"origin/{base}"], cwd=checkout)
     await _git(["add", "--all"], cwd=checkout)
     email = f"{author_id}+{author_login}@users.noreply.github.com"
     await _git(

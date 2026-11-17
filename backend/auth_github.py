@@ -59,6 +59,8 @@ class _GitHubConnection:
 
 # In-memory stores (Replace with Redis in multi-worker production), like auth_jira.py.
 GITHUB_SESSION_STORE: Dict[str, _GitHubConnection] = {}
+# full_name -> folder where the repository was cloned on this machine. Kept across chat sessions.
+GITHUB_CLONE_REGISTRY: Dict[str, str] = {}
 PENDING_OAUTH_STATES: Dict[str, str] = {}  # OAuth state -> session_id
 
 # Connections are also saved encrypted on disk so backend restarts and auto-reloads keep them.
@@ -76,15 +78,18 @@ def _fernet() -> Fernet:
 
 def save_github_store() -> None:
     payload = {
-        session_id: {
-            "access_token": connection.access_token,
-            "login": connection.login,
-            "user_id": connection.user_id,
-            "repositories": [repo.model_dump() for repo in connection.repositories],
-            "selected": connection.selected,
-            "checkouts": connection.checkouts,
-        }
-        for session_id, connection in GITHUB_SESSION_STORE.items()
+        "sessions": {
+            session_id: {
+                "access_token": connection.access_token,
+                "login": connection.login,
+                "user_id": connection.user_id,
+                "repositories": [repo.model_dump() for repo in connection.repositories],
+                "selected": connection.selected,
+                "checkouts": connection.checkouts,
+            }
+            for session_id, connection in GITHUB_SESSION_STORE.items()
+        },
+        "clones": GITHUB_CLONE_REGISTRY,
     }
     encrypted = _fernet().encrypt(json.dumps(payload).encode("utf-8"))
     temp_file = GITHUB_STORE_FILE.with_suffix(".tmp")
@@ -100,7 +105,10 @@ def _load_github_store() -> None:
     except (InvalidToken, ValueError, OSError):
         logger.warning("Saved GitHub connections could not be read; users must connect GitHub again.")
         return
-    for session_id, data in payload.items():
+    # Older files hold the sessions at the top level, without the "sessions" and "clones" keys.
+    sessions = payload["sessions"] if "sessions" in payload else payload
+    GITHUB_CLONE_REGISTRY.update(payload.get("clones", {}))
+    for session_id, data in sessions.items():
         GITHUB_SESSION_STORE[session_id] = _GitHubConnection(
             access_token=data["access_token"],
             login=data["login"],
@@ -229,7 +237,15 @@ async def _github_get(client: httpx.AsyncClient, token: str, path: str, params: 
     return await client.get(f"{GITHUB_API_URL}{path}", params=params, headers={"Authorization": f"Bearer {token}"})
 
 
+def drop_rejected_connection(session_id: str) -> None:
+    """Forgets a session whose GitHub token was rejected (revoked or expired). Saved clone folders are kept."""
+    if GITHUB_SESSION_STORE.pop(session_id, None) is not None:
+        save_github_store()
+
+
 def _describe_api_error(resp: httpx.Response) -> str:
+    if resp.status_code == 401:
+        return "GitHub rejected the saved login. Connect GitHub again from the sidebar and try again."
     if resp.status_code == 403:
         return (
             "GitHub denied access. If the organization enforces SAML SSO, authorize this OAuth app "
