@@ -57,7 +57,7 @@ class _GitHubConnection:
     checkouts: Dict[str, str] = field(default_factory=dict)
 
 
-# In-memory stores (Replace with Redis in multi-worker production), like auth_jira.py.
+# In-memory stores (Replace with Redis in multi-worker production), like atlassian_auth.py.
 GITHUB_SESSION_STORE: Dict[str, _GitHubConnection] = {}
 # full_name -> folder where the repository was cloned on this machine. Kept across chat sessions.
 GITHUB_CLONE_REGISTRY: Dict[str, str] = {}

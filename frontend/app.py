@@ -23,22 +23,10 @@ def _resolve_session_id() -> str:
 SESSION_ID = _resolve_session_id()
 
 st.set_page_config(
-    page_title="Agentic Ops | Autonomous Production Troubleshooter",
-    page_icon="🤖",
+    page_title="Autonomous Coding Agent",
+    page_icon=":material/smart_toy:",
     layout="wide",
 )
-
-st.markdown("""
-    <style>
-        h1, h2, h3, h4 {
-            font-family: 'Inter', sans-serif;
-        }
-        .stButton>button {
-            border-radius: 6px;
-            font-weight: 600;
-        }
-    </style>
-""", unsafe_allow_html=True)
 
 st.markdown("""
     <script>
@@ -53,7 +41,11 @@ query_params = st.query_params
 if "action" in query_params:
     action_val = query_params["action"]
     if action_val == "connected":
-        st.session_state["trigger_toast"] = ("Successfully connected to Jira workspace via OAuth!", "🎉")
+        st.session_state["trigger_toast"] = ("Connected to Jira through the Atlassian MCP server.", "🎉")
+        st.session_state["jira_status_stale"] = True
+    elif action_val == "jira_failed":
+        reason = query_params.get("reason", "unknown error")
+        st.session_state["trigger_toast"] = (f"Jira connection failed: {reason}", "⚠️")
     elif action_val == "github_connected":
         st.session_state["github_callback_pending"] = True
     elif action_val == "github_failed":
@@ -99,6 +91,18 @@ def refresh_status_cache():
     _get_status.clear()
 
 
+def switch_jira_site():
+    site_id = st.session_state.get("jira_site_selection")
+    try:
+        resp = httpx.post(
+            f"{BACKEND_URL}/auth/jira/switch-site", params={"session_id": SESSION_ID, "site_id": site_id}, timeout=10.0
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError:
+        st.session_state["trigger_toast"] = ("Could not switch the Jira site. Is the backend running?", "⚠️")
+    refresh_status_cache()
+
+
 def save_github_selection():
     chosen = st.session_state.get("github_repo_selection", [])
     try:
@@ -129,6 +133,9 @@ def browse_folder_into(widget_key: str):
         st.session_state[widget_key] = folder
 
 
+if st.session_state.pop("jira_status_stale", False):
+    # A status cached before the OAuth redirect would still say disconnected.
+    refresh_status_cache()
 status_data = fetch_connection_status()
 cloud_status = fetch_cloud_status()
 github_status = fetch_github_status()
@@ -162,20 +169,38 @@ with st.sidebar:
     st.caption("Enterprise Autonomous Reliability Platform")
     st.divider()
 
-    # --- JIRA CONNECTION ---
+    # --- JIRA CONNECTION (Atlassian Rovo MCP server) ---
     st.markdown("#### 📋 Issue Tracker Integration")
     if status_data and status_data.get("connected"):
-        st.success("🟢 Connected")
-        st.caption(f"Workspace: `{status_data.get('site_name')}`")
-        if st.button("Disconnect Workspace", type="secondary", use_container_width=True):
-            httpx.post(f"{BACKEND_URL}/auth/jira/disconnect", params={"session_id": SESSION_ID}, timeout=5.0)
+        st.success("🟢 Connected via Atlassian MCP")
+        mode = "OAuth 2.1" if status_data.get("auth_mode") == "oauth" else "API token"
+        st.caption(f"Signed in as `{status_data.get('account') or 'unknown'}` ({mode})")
+        sites = status_data.get("sites") or []
+        if len(sites) > 1:
+            site_ids = [site["id"] for site in sites]
+            names = {site["id"]: site["name"] for site in sites}
+            current = status_data.get("cloud_id")
+            st.session_state["jira_site_selection"] = current if current in site_ids else site_ids[0]
+            st.selectbox(
+                "Jira site",
+                site_ids,
+                format_func=lambda site_id: names[site_id],
+                key="jira_site_selection",
+                on_change=switch_jira_site,
+            )
+        elif status_data.get("site_name"):
+            st.caption(f"Site: `{status_data.get('site_name')}`")
+        else:
+            st.caption("No Jira site was found for this account.")
+        if st.button("Disconnect Workspace", type="secondary", width="stretch"):
+            httpx.post(f"{BACKEND_URL}/auth/jira/disconnect", params={"session_id": SESSION_ID}, timeout=10.0)
             st.toast("Disconnected.", icon="🔌")
             refresh_status_cache()
             st.rerun()
     else:
         st.warning("🔴 Disconnected")
-        jira_tab1, jira_tab2 = st.tabs(["🔐 OAuth 2.0", "🔑 API Token"])
-        
+        jira_tab1, jira_tab2 = st.tabs(["🔐 OAuth 2.1", "🔑 API Token"])
+
         with jira_tab1:
             oauth_login_url = f"{BACKEND_URL}/auth/jira/login?session_id={SESSION_ID}"
             st.markdown(f"""
@@ -185,27 +210,45 @@ with st.sidebar:
                     </a>
                 </div>
             """, unsafe_allow_html=True)
-            
+            st.caption("Recommended. Uses the Atlassian Rovo MCP server with your own Jira permissions.")
+
         with jira_tab2:
-            with st.form("pat_auth_form"):
-                site_url = st.text_input("Workspace URL", placeholder="https://domain.atlassian.net")
+            st.caption(
+                "Needs an Atlassian admin to allow API-token sign-in for the Rovo MCP server, and a token "
+                "created with scopes for the Rovo MCP app: read:jira:agent-interface, search:jira:agent-interface, "
+                "read:me and read:account (add write:jira:agent-interface to create or edit work items) "
+                "([create one](https://id.atlassian.com/manage-profile/security/api-tokens?autofillToken&expiryDays=max&appId=mcp-v2&selectedScopes=all))."
+            )
+            with st.form("api_token_form"):
+                site_url = st.text_input("Jira site URL", placeholder="https://your-domain.atlassian.net")
                 email = st.text_input("Email", placeholder="you@company.com")
                 api_token = st.text_input("API Token", type="password")
-                submitted_pat = st.form_submit_button("Connect via Token", use_container_width=True)
-                if submitted_pat:
+                submitted_token = st.form_submit_button("Connect via Token", width="stretch")
+                if submitted_token:
                     with st.spinner("Connecting..."):
-                        resp = httpx.post(
-                            f"{BACKEND_URL}/auth/jira/connect-pat",
-                            params={"session_id": SESSION_ID},
-                            json={"site_url": site_url, "email": email, "api_token": api_token},
-                            timeout=15.0,
-                        )
-                        if resp.status_code == 200:
+                        try:
+                            resp = httpx.post(
+                                f"{BACKEND_URL}/auth/jira/connect-token",
+                                params={"session_id": SESSION_ID},
+                                json={"site_url": site_url, "email": email, "api_token": api_token},
+                                timeout=60.0,
+                            )
+                        except httpx.HTTPError:
+                            resp = None
+                        if resp is not None and resp.status_code == 200:
                             st.toast("Connected successfully!", icon="🎉")
                             refresh_status_cache()
                             st.rerun()
+                        elif resp is None:
+                            st.error("Could not reach the backend.")
                         else:
-                            st.error(f"Failed: {resp.text}")
+                            try:
+                                detail = resp.json().get("detail")
+                            except ValueError:
+                                detail = None
+                            if isinstance(detail, list):
+                                detail = "Fill in the site URL, email, and API token."
+                            st.error(f"Failed: {detail or resp.text}")
 
     st.divider()
 
@@ -321,8 +364,8 @@ with st.sidebar:
     st.checkbox("Human-in-the-Loop Review Gate", value=True)
 
 # ---------------- MAIN WORKSPACE: GEMINI-STYLE CONVERSATIONAL CHAT ----------------
-st.markdown("## 🤖 Autonomous Production Troubleshooter")
-st.caption("Ask any question about your connected workspace: boards, sprints, work items, counts, or details.")
+st.title(":material/smart_toy: Autonomous Coding Agent", anchor=False)
+st.caption("Fix bugs and build features in your GitHub repositories, and track the work in Jira, all from one chat.")
 st.divider()
 
 def render_message(message):

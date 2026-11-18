@@ -4,23 +4,33 @@ from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import asyncio
 import json
+import logging
 import urllib.parse
 from typing import Optional
 from backend.config import settings
+from backend.network import configure_outbound_network
+
+configure_outbound_network()
+
 from backend.models import (
-    JiraSessionState,
-    PATConnectRequest,
     ChatRequest,
     ChatResponse,
     AskAnswerRequest,
 )
-from backend.auth_jira import (
-    get_or_create_session,
-    disconnect_session,
-    build_atlassian_oauth_url,
-    exchange_code_and_resolve_cloud_id,
-    connect_via_pat,
+from backend.atlassian_auth import (
+    APITokenConnectRequest,
+    AtlassianAuthError,
+    AtlassianStatus,
+    build_oauth_url,
+    complete_oauth,
+    connect_api_token,
+    disconnect_atlassian,
+    discard_oauth_state,
+    drop_connection,
+    get_atlassian_status,
+    select_site,
 )
+from backend.atlassian_mcp import AtlassianMCPError, AtlassianRejectedError, forget_tools, load_workspace
 from backend.auth_github import (
     GitHubConnectionError,
     GitHubSelectionRequest,
@@ -33,7 +43,6 @@ from backend.auth_github import (
     set_selected_repositories,
 )
 from backend.github_workspace import pick_folder
-from backend.jira_service import JiraClientService
 from backend.session_cookie import redirect_with_session
 from backend.agent import answer_question, stream_answer, resume_answer
 from backend.cloud_connector import (
@@ -46,6 +55,7 @@ from backend.cloud_connector import (
 )
 
 app = FastAPI(title="FDE Agentic Ops - Production Troubleshooter API", version="2.1.0")
+logger = logging.getLogger(__name__)
 
 app.add_middleware(
     CORSMiddleware,
@@ -56,55 +66,103 @@ app.add_middleware(
 )
 
 
-# ---------------- STAGE 1: JIRA ENDPOINTS ----------------
-@app.get("/auth/jira/status", response_model=JiraSessionState)
+# ---------------- STAGE 1: JIRA ENDPOINTS (Atlassian Rovo MCP server) ----------------
+def _jira_failed(reason: str) -> RedirectResponse:
+    query = urllib.parse.urlencode({"action": "jira_failed", "reason": reason})
+    return RedirectResponse(url=f"{settings.frontend_url}?{query}")
+
+
+@app.get("/auth/jira/status", response_model=AtlassianStatus)
 async def get_jira_status(session_id: str = Query(default="default-engineer-session")):
-    return get_or_create_session(session_id)
+    status = get_atlassian_status(session_id)
+    if status.connected and not status.sites:
+        # Connections saved before their site list could be read get it now.
+        try:
+            await load_workspace(session_id)
+        except (AtlassianAuthError, AtlassianMCPError) as e:
+            logger.warning("Could not load the Atlassian sites: %s", e)
+        status = get_atlassian_status(session_id)
+    return status
 
 
-@app.post("/auth/jira/disconnect", response_model=JiraSessionState)
+@app.post("/auth/jira/disconnect", response_model=AtlassianStatus)
 async def jira_disconnect(session_id: str = Query(default="default-engineer-session")):
-    return disconnect_session(session_id)
+    forget_tools(session_id)
+    return await disconnect_atlassian(session_id)
 
 
 @app.get("/auth/jira/login")
 async def jira_oauth_login(session_id: str = Query(default="default-engineer-session")):
-    if not settings.jira_client_id or not settings.jira_client_secret:
-        raise HTTPException(
-            status_code=400,
-            detail="JIRA_CLIENT_ID and JIRA_CLIENT_SECRET must be set in .env for OAuth 2.0 flow.",
-        )
-    auth_url = build_atlassian_oauth_url(session_id)
+    try:
+        auth_url = await build_oauth_url(session_id)
+    except AtlassianAuthError as e:
+        return _jira_failed(str(e))
+    except httpx.HTTPError as e:
+        logger.error("Could not reach Atlassian to start the Jira sign-in: %r", e)
+        return _jira_failed(f"Could not reach Atlassian ({type(e).__name__}). Check the network or HTTPS_PROXY in .env.")
     return RedirectResponse(url=auth_url)
 
 
 @app.get("/auth/jira/callback")
-async def jira_oauth_callback(code: str, state: str = "default-engineer-session"):
-    await exchange_code_and_resolve_cloud_id(code=code, session_id=state)
-    return redirect_with_session(f"{settings.frontend_url}?action=connected", state)
-
-
-@app.post("/auth/jira/switch-site", response_model=JiraSessionState)
-async def switch_jira_site(site_id: str = Query(...), session_id: str = Query(default="default-engineer-session")):
-    session = get_or_create_session(session_id)
-    if not session.available_sites:
-        raise HTTPException(status_code=400, detail="No available sites found in session.")
-
-    selected_site = next((s for s in session.available_sites if s.id == site_id), None)
-    if not selected_site:
-        raise HTTPException(status_code=404, detail="Selected site not found.")
-
-    session.cloud_id = selected_site.id
-    session.site_name = selected_site.name
-    session.site_url = selected_site.url
-    return session
-
-
-@app.post("/auth/jira/connect-pat", response_model=JiraSessionState)
-async def jira_connect_pat(
-    req: PATConnectRequest, session_id: str = Query(default="default-engineer-session")
+async def jira_oauth_callback(
+    code: Optional[str] = None,
+    state: Optional[str] = None,
+    error: Optional[str] = None,
+    error_description: Optional[str] = None,
 ):
-    return await connect_via_pat(session_id=session_id, req=req)
+    if error or not code or not state:
+        if state:
+            discard_oauth_state(state)
+        return _jira_failed(error_description or error or "Atlassian did not return an authorization code.")
+    session_id = None
+    try:
+        session_id = await complete_oauth(code=code, state=state)
+        await load_workspace(session_id)
+    except (AtlassianAuthError, AtlassianMCPError) as e:
+        if session_id:
+            drop_connection(session_id)
+        return _jira_failed(str(e))
+    except httpx.HTTPError as e:
+        logger.error("Could not reach Atlassian to finish the Jira sign-in: %r", e)
+        if session_id:
+            drop_connection(session_id)
+        return _jira_failed(f"Could not reach Atlassian ({type(e).__name__}). Check the network or HTTPS_PROXY in .env.")
+    return redirect_with_session(f"{settings.frontend_url}?action=connected", session_id)
+
+
+@app.post("/auth/jira/switch-site", response_model=AtlassianStatus)
+async def switch_jira_site(site_id: str = Query(...), session_id: str = Query(default="default-engineer-session")):
+    try:
+        return select_site(session_id, site_id)
+    except AtlassianAuthError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/auth/jira/connect-token", response_model=AtlassianStatus)
+async def jira_connect_token(
+    req: APITokenConnectRequest, session_id: str = Query(default="default-engineer-session")
+):
+    try:
+        await connect_api_token(session_id, req)
+        await load_workspace(session_id)
+    except AtlassianRejectedError:
+        drop_connection(session_id)
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Atlassian rejected this email and API token (HTTP 401). Check that: "
+                "1) API-token sign-in is turned on in Atlassian Administration > Connectors > Atlassian MCP server > "
+                "Authentication; 2) the token was created with scopes for the Rovo MCP app, including "
+                "read:jira:agent-interface, search:jira:agent-interface, read:me and read:account "
+                "(a classic token without scopes does not work); "
+                "3) the email is the one of the Atlassian account that created the token; "
+                "4) the token was copied in full and has not expired."
+            ),
+        )
+    except (AtlassianAuthError, AtlassianMCPError) as e:
+        drop_connection(session_id)
+        raise HTTPException(status_code=400, detail=str(e))
+    return get_atlassian_status(session_id)
 
 
 # ---------------- GITHUB ENDPOINTS ----------------
@@ -167,27 +225,6 @@ async def github_oauth_callback(
             reason = "Could not reach GitHub. Try again."
     query = urllib.parse.urlencode({"action": "github_failed", "reason": reason})
     return RedirectResponse(url=f"{settings.frontend_url}?{query}")
-
-
-@app.get("/jira/projects")
-async def list_jira_projects(session_id: str = Query(default="default-engineer-session")):
-    session = get_or_create_session(session_id)
-    service = JiraClientService(session)
-    return await service.fetch_projects()
-
-
-@app.get("/jira/tickets")
-async def list_recent_tickets(
-    start_at: int = Query(default=0, ge=0),
-    max_results: int = Query(default=10, ge=1, le=50),
-    project_key: Optional[str] = Query(default=None),
-    session_id: str = Query(default="default-engineer-session"),
-):
-    session = get_or_create_session(session_id)
-    service = JiraClientService(session)
-    return await service.fetch_recent_tickets(
-        start_at=start_at, max_results=max_results, project_key=project_key
-    )
 
 
 # ---------------- STAGE 2: STANDALONE CLOUD CONNECTOR ENDPOINTS ----------------

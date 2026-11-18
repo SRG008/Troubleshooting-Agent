@@ -1,0 +1,28 @@
+[theme]
+# Inter for text and headings, JetBrains Mono for code. The browser loads them from Google Fonts.
+font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+headingFont = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap"
+codeFont = "'JetBrains Mono':https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap"
+headingFontWeights = [700, 600, 600, 600, 500, 500]
+baseRadius = "medium"
+showSidebarBorder = true
+
+[theme.light]
+primaryColor = "#4F46E5"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F4F4F5"
+textColor = "#18181B"
+
+[theme.light.sidebar]
+backgroundColor = "#FAFAFA"
+secondaryBackgroundColor = "#F0F0F2"
+
+[theme.dark]
+primaryColor = "#6366F1"
+backgroundColor = "#0B0B0F"
+secondaryBackgroundColor = "#18181B"
+textColor = "#FAFAFA"
+
+[theme.dark.sidebar]
+backgroundColor = "#111115"
+secondaryBackgroundColor = "#1C1C22"

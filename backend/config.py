@@ -21,8 +21,13 @@ class Settings(BaseSettings):
 
     embedding_model: str = "gemini-embedding-001"
 
-    jira_client_id: str = ""
-    jira_client_secret: str = ""
+    # Jira is reached through the Atlassian Rovo MCP server. OAuth needs no client ID: the backend
+    # registers itself with Atlassian (dynamic client registration) for this redirect URI.
+    atlassian_mcp_url: str = "https://mcp.atlassian.com/v2/mcp"
+    atlassian_mcp_scopes: str = (
+        "read:jira:agent-interface write:jira:agent-interface search:jira:agent-interface "
+        "read:me read:account offline_access"
+    )
     jira_redirect_uri: str = "http://localhost:8000/auth/jira/callback"
 
     github_client_id: str = ""
@@ -32,6 +37,13 @@ class Settings(BaseSettings):
 
     backend_url: str = "http://localhost:8000"
     frontend_url: str = "http://localhost:8501"
+
+    # Outbound network. Set HTTPS_PROXY when the machine reaches the internet through a proxy that
+    # Python cannot discover itself (for example Zscaler's local proxy, configured through a PAC file).
+    https_proxy: str = ""
+    # Verify HTTPS with the operating system's certificate store, so TLS-inspecting proxies whose root
+    # certificate is installed by IT (Zscaler, Netskope, ...) are trusted.
+    use_system_certificates: bool = True
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

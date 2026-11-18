@@ -19,21 +19,77 @@ from backend.llm.base import (
 from backend.llm.http import post_json, stream_sse
 
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+_MAX_SCHEMA_DEPTH = 12
 
 
-def _gemini_schema(schema: Any) -> Any:
-    """Gemini expects uppercase type names (OBJECT, STRING, ...); convert the standard JSON Schema recursively."""
-    if isinstance(schema, dict):
-        out = {}
-        for key, value in schema.items():
-            if key == "type" and isinstance(value, str):
-                out[key] = value.upper()
-            else:
-                out[key] = _gemini_schema(value)
-        return out
-    if isinstance(schema, list):
-        return [_gemini_schema(item) for item in schema]
-    return schema
+def _gemini_schema(schema: Any, root: Any = None, depth: int = 0) -> Dict[str, Any]:
+    """Converts standard JSON Schema to the OpenAPI subset Gemini accepts for function parameters.
+
+    Tool schemas from MCP servers use features Gemini rejects ($ref, anyOf, type lists, const,
+    additionalProperties, formats), so only the supported keywords are kept, local $refs are inlined,
+    and type names are uppercased. A nested object without declared properties becomes a string holding
+    JSON, which the MCP bridge parses back into an object.
+    """
+    root = schema if root is None else root
+    if not isinstance(schema, dict) or depth > _MAX_SCHEMA_DEPTH:
+        return {"type": "STRING"}
+    ref = schema.get("$ref")
+    if isinstance(ref, str) and ref.startswith("#/"):
+        target: Any = root
+        for part in ref[2:].split("/"):
+            target = target.get(part, {}) if isinstance(target, dict) else {}
+        merged = {**target, **{k: v for k, v in schema.items() if k != "$ref"}}
+        return _gemini_schema(merged, root, depth + 1)
+
+    nullable = False
+    variants = schema.get("anyOf") or schema.get("oneOf")
+    if variants and "type" not in schema:
+        concrete = [v for v in variants if not (isinstance(v, dict) and v.get("type") == "null")]
+        nullable = len(concrete) < len(variants)
+        chosen = concrete[0] if concrete else {}
+        merged = {**chosen, **{k: v for k, v in schema.items() if k not in ("anyOf", "oneOf")}}
+        converted = _gemini_schema(merged, root, depth + 1)
+        if nullable:
+            converted["nullable"] = True
+        return converted
+
+    kind = schema.get("type")
+    if isinstance(kind, list):
+        nullable = "null" in kind
+        kind = next((k for k in kind if k != "null"), "string")
+    if "const" in schema and "enum" not in schema:
+        schema = {**schema, "enum": [schema["const"]]}
+    if not kind or kind == "null":
+        kind = "object" if "properties" in schema else "array" if "items" in schema else "string"
+    enum = schema.get("enum")
+    if enum and kind not in ("string", "integer", "number", "boolean"):
+        enum = None
+    if enum and kind != "string":
+        # Gemini only accepts enums on strings; keep the real type and list the values in the description.
+        allowed = ", ".join(str(value) for value in enum)
+        schema = {**schema, "description": f"{schema.get('description') or ''} Allowed values: {allowed}.".strip()}
+        enum = None
+
+    out: Dict[str, Any] = {}
+    properties = schema.get("properties")
+    if kind == "object" and not properties and depth > 0:
+        kind = "string"
+        out["description"] = ((schema.get("description") or "") + " (a JSON object, written as JSON text)").strip()
+    elif schema.get("description"):
+        out["description"] = str(schema["description"])
+    out["type"] = str(kind).upper()
+    if nullable:
+        out["nullable"] = True
+    if enum:
+        out["enum"] = [str(value) for value in enum if value is not None]
+    if kind == "object":
+        out["properties"] = {name: _gemini_schema(value, root, depth + 1) for name, value in (properties or {}).items()}
+        required = [name for name in schema.get("required") or [] if name in out["properties"]]
+        if required:
+            out["required"] = required
+    if kind == "array":
+        out["items"] = _gemini_schema(schema.get("items") or {"type": "string"}, root, depth + 1)
+    return out
 
 
 class GeminiProvider(LLMProvider):

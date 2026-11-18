@@ -3,10 +3,12 @@ import json
 import logging
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
+from backend import atlassian_mcp
+from backend.atlassian_auth import AtlassianAuthError, AtlassianStatus, get_atlassian_status
 from backend.auth_github import get_github_connection
 from backend.github_tools import GITHUB_TOOL_SPECS, build_github_handlers
 from backend.github_workspace import review_for_question
@@ -22,226 +24,109 @@ from backend.llm import (
     get_llm_chain,
 )
 from backend.models import AgentStepTrace, ChatResponse, ChatTurn
-from backend.trackers.base import IssueTracker
-from backend.trackers.registry import get_active_tracker
 
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 15
 MAX_HISTORY_TURNS = 10
 MAX_TOOL_RESULT_CHARS = 15000
-METADATA_TTL_SECONDS = 300.0
+# Full work item lists (compact rows, up to 200 items) need more room than other tool results.
+MAX_LIST_RESULT_CHARS = 45000
 PENDING_ASK_TTL_SECONDS = 1800.0
 ASK_TOOL = "ask_user"
 ASK_INPUT_TYPES = {"choice", "text", "number", "date", "boolean", "folder"}
+APPROVE = "Approve"
+REJECT = "Reject"
 
-_metadata_cache: Dict[Tuple[str, str, str], Tuple[float, Any]] = {}
+Handler = Callable[[Dict[str, Any]], Awaitable[Any]]
 
 
 @dataclass
 class _PendingAsk:
-    """An agent run paused on an ask_user call, waiting for the user's answer."""
+    """An agent run paused for the user: an ask_user question, or the approval of a Jira change.
+
+    For an approval, `approvals` holds the waiting tool calls; the first one is being asked about.
+    """
 
     session_id: str
     messages: List[Message]
     trace: List[AgentStepTrace]
     call_id: str
     created: float
+    approvals: List[ToolCall] = field(default_factory=list)
+
+
+@dataclass
+class _RunContext:
+    handlers: Dict[str, Handler]
+    tools: List[ToolSpec]
+    # Tools that change data. They only run after the user approves the exact call.
+    approval_required: Set[str]
+    provider_name: str
+    system_prompt: str
 
 
 _pending_asks: Dict[str, _PendingAsk] = {}
 
-TOOL_SPECS: List[ToolSpec] = [
-    ToolSpec(
-        name="list_projects",
-        description="List all projects/spaces the user can access in the connected workspace.",
-        parameters={"type": "object", "properties": {}},
+ASK_TOOL_SPEC = ToolSpec(
+    name=ASK_TOOL,
+    description=(
+        "Ask the user ONE question and wait for the answer. The question is shown to the user as a form field. "
+        "Use it whenever a required piece of information is missing (for example which project or a required field "
+        "value). Never ask more than one question per turn."
     ),
-    ToolSpec(
-        name="list_boards",
-        description="List boards (Scrum/Kanban/team boards). Optionally limit to one project key.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "project_key": {"type": "string", "description": "Project key to filter boards by."},
+    parameters={
+        "type": "object",
+        "properties": {
+            "question": {"type": "string", "description": "The question, written for the user."},
+            "input_type": {
+                "type": "string",
+                "enum": ["choice", "text", "number", "date", "boolean", "folder"],
+                "description": (
+                    "How the user answers. Use choice for a fixed set of options. "
+                    "Use folder for a folder on this machine; the user picks it with a Browse button."
+                ),
+            },
+            "options": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Options for input_type choice. Use the real names returned by tools.",
+            },
+            "allow_other": {
+                "type": "boolean",
+                "description": "For input_type choice only: true lets the user type an answer that is not in the options.",
+            },
+            "details": {
+                "type": "string",
+                "description": (
+                    "Optional Markdown shown above the question, for example the explanation of a change "
+                    "the user must review before answering."
+                ),
+            },
+            "code": {
+                "type": "string",
+                "description": (
+                    "Optional code shown in a code viewer with a copy button, for example the exact diff of a file. "
+                    "Use the exact text from the tool result, with its line breaks and indentation."
+                ),
+            },
+            "code_language": {
+                "type": "string",
+                "description": "Language of code for highlighting, for example diff, csharp, python or json.",
+            },
+            "required": {
+                "type": "boolean",
+                "description": "False if the user may skip the question. Default true.",
             },
         },
-    ),
-    ToolSpec(
-        name="list_sprints",
-        description="List sprints of a board. Use the board id from list_boards.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "board_id": {"type": "string", "description": "Board id from list_boards."},
-                "state": {"type": "string", "description": "Comma-separated states: active, future, closed."},
-            },
-            "required": ["board_id"],
-        },
-    ),
-    ToolSpec(
-        name="search_work_items",
-        description=(
-            "Search work items (tickets/issues/tasks) with a query written in the workspace's native query "
-            "language. Returns key, summary, type, status, priority, assignee and project for each item. "
-            "Use this for any listing or filtering question. Returns at most 100 items."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Query in the native query language."},
-                "max_results": {"type": "integer", "description": "Maximum items to return (1-100)."},
-            },
-            "required": ["query"],
-        },
-    ),
-    ToolSpec(
-        name="count_work_items",
-        description="Count work items matching a query written in the workspace's native query language.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Query in the native query language."},
-            },
-            "required": ["query"],
-        },
-    ),
-    ToolSpec(
-        name="get_work_item",
-        description="Get full details of one work item (description, comments, labels) by its key or id.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "item_id": {"type": "string", "description": "Work item key, e.g. KAN-1."},
-            },
-            "required": ["item_id"],
-        },
-    ),
-    ToolSpec(
-        name=ASK_TOOL,
-        description=(
-            "Ask the user ONE question and wait for the answer. The question is shown to the user as a form field. "
-            "Use it whenever a required piece of information is missing (for example which project, a required field "
-            "value, or a confirmation before creating or changing something). Never ask more than one question per turn."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "question": {"type": "string", "description": "The question, written for the user."},
-                "input_type": {
-                    "type": "string",
-                    "enum": ["choice", "text", "number", "date", "boolean", "folder"],
-                    "description": (
-                        "How the user answers. Use choice for a fixed set of options. "
-                        "Use folder for a folder on this machine; the user picks it with a Browse button."
-                    ),
-                },
-                "options": {
-                    "type": "array",
-                    "items": {"type": "string"},
-                    "description": "Options for input_type choice. Use the real names returned by tools.",
-                },
-                "allow_other": {
-                    "type": "boolean",
-                    "description": (
-                        "For input_type choice only: true lets the user type an answer that is not in the options."
-                    ),
-                },
-                "details": {
-                    "type": "string",
-                    "description": (
-                        "Optional Markdown shown above the question, for example the explanation of a change "
-                        "the user must review before answering."
-                    ),
-                },
-                "code": {
-                    "type": "string",
-                    "description": (
-                        "Optional code shown in a code viewer with a copy button, for example the exact diff of a file. "
-                        "Use the exact text from the tool result, with its line breaks and indentation."
-                    ),
-                },
-                "code_language": {
-                    "type": "string",
-                    "description": "Language of code for highlighting, for example diff, csharp, python or json.",
-                },
-                "required": {
-                    "type": "boolean",
-                    "description": "False if the user may skip the question. Default true.",
-                },
-            },
-            "required": ["question", "input_type"],
-        },
-    ),
-    ToolSpec(
-        name="list_issue_types",
-        description="List the work item types (Bug, Task, Story, ...) that can be created in a project.",
-        parameters={
-            "type": "object",
-            "properties": {"project_key": {"type": "string", "description": "Project key, e.g. KAN."}},
-            "required": ["project_key"],
-        },
-    ),
-    ToolSpec(
-        name="get_required_fields",
-        description=(
-            "List the REQUIRED fields needed to create a work item of a type in a project, with allowed values "
-            "where defined. Optional fields are not returned. Use it before create_work_item."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "project_key": {"type": "string", "description": "Project key, e.g. KAN."},
-                "issue_type": {"type": "string", "description": "Issue type name from list_issue_types, e.g. Bug."},
-            },
-            "required": ["project_key", "issue_type"],
-        },
-    ),
-    ToolSpec(
-        name="search_users",
-        description="Find users by name or email. Returns account ids needed for user fields such as assignee.",
-        parameters={
-            "type": "object",
-            "properties": {"query": {"type": "string", "description": "Part of the user's name or email."}},
-            "required": ["query"],
-        },
-    ),
-    ToolSpec(
-        name="create_work_item",
-        description=(
-            "Create a work item. Only call it after the user asked to create one and confirmed the details. "
-            "Pass every required field from get_required_fields as a field_id/value pair."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "project_key": {"type": "string", "description": "Project key, e.g. KAN."},
-                "issue_type": {"type": "string", "description": "Issue type name, e.g. Task."},
-                "values": {
-                    "type": "array",
-                    "description": "Field values to set.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "field_id": {"type": "string", "description": "field_id from get_required_fields."},
-                            "value": {"type": "string", "description": "The user's answer, as text."},
-                        },
-                        "required": ["field_id", "value"],
-                    },
-                },
-            },
-            "required": ["project_key", "issue_type", "values"],
-        },
-    ),
-]
+        "required": ["question", "input_type"],
+    },
+)
 
 
-ASK_TOOL_SPEC = next(spec for spec in TOOL_SPECS if spec.name == ASK_TOOL)
-
-
-def _build_system_prompt(tracker: Optional[IssueTracker], github: Optional[Tuple[str, List[str]]] = None) -> str:
+def _build_system_prompt(jira: Optional[Tuple[AtlassianStatus, str]], github: Optional[Tuple[str, List[str]]] = None) -> str:
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    parts = [_tracker_prompt(tracker, today) if tracker else _no_tracker_prompt(today)]
+    parts = [_jira_prompt(*jira, today) if jira else _no_tracker_prompt(today)]
     if github is not None:
         parts.append(_github_prompt(*github))
     return "\n".join(parts)
@@ -272,7 +157,7 @@ Repository tools: list_repositories, use_local_clone, find_previous_clone, list_
 - For questions about commits, history, or activity (for example how many commits there are), call get_repo_history and report its commit_count, then list the latest commits with each commit's short sha, author, date, and message. If no tool can answer a question, say so plainly instead of guessing.
 
 Fixing a bug or building a feature:
-1. Identify the task. If the user asks to fix an issue or build a feature without giving a task or bug ID, ask for the ID (ask_user, text). If the user already gave an ID in the message, do not ask for it again. When a work item tool is available, read the item with get_work_item to understand the request.
+1. Identify the task. If the user asks to fix an issue or build a feature without giving a task or bug ID, ask for the ID (ask_user, text). If the user already gave an ID in the message, do not ask for it again. When Jira is connected, read the item with getJiraIssue to understand the request.
 2. If more than one repository is selected and the request does not name one, ask which repository (ask_user, choice).
 3. Analyze the code: search_repo_code and get_repo_file. Read every file you need before you change it. Never guess file contents.
 4. Before changing any file, ask whether to create a new branch for this work (ask_user, boolean). If yes, ask for the branch name (ask_user, text) and call create_repo_branch with it. Then make the smallest correct change with write_repo_file on the current branch. Do not change unrelated code. Before the first of these change calls, make sure the repository has a local clone, as described above.
@@ -294,33 +179,47 @@ Answers about a repository must be based on tool results. Answer in clear Markdo
 """
 
 
-def _tracker_prompt(tracker: IssueTracker, today: str) -> str:
-    return f"""You are an AI assistant for issue tracking, connected to the {tracker.name} workspace "{tracker.workspace_name}".
-Current date and time: {today}.
+def _jira_prompt(status: AtlassianStatus, load_error: str, today: str) -> str:
+    if load_error:
+        return f"""You are an AI assistant for issue tracking. Current date and time: {today}.
 
-Answer the user's question by calling the available tools to query the live workspace. You can answer questions about anything in the account: projects, boards, sprints, work items, counts, assignees, statuses, and details.
+Jira is connected, but its tools could not be loaded: {load_error}
+If the user asks about Jira, show this error and ask them to reconnect Jira from the sidebar. Never invent workspace data.
+Answer in clear Markdown.
+"""
+    if status.cloud_id:
+        site = f'Use the site "{status.site_name}" ({status.site_url}), cloudId "{status.cloud_id}".'
+    else:
+        site = "No site is selected yet; call getAccessibleAtlassianResources to find the cloudId."
+    account = status.account or "the signed-in user"
+    return f"""You are an AI assistant for issue tracking, connected to Jira through the Atlassian Rovo MCP server as {account}.
+Current date and time: {today}.
+{site} Pass this cloudId to every tool that asks for one.
+
+Answer the user's question by calling the Jira tools to query the live workspace: projects (also called spaces), boards, sprints, work items, comments, counts, assignees, statuses, and details.
 
 Rules:
 - If the question is not about the workspace (for example general knowledge), answer briefly from general knowledge without calling any tool.
 - Never invent keys, names, counts or statuses. Base every statement about the workspace on tool results. If nothing matches, say so.
-- Do not assume a project, board or sprint. If the question is not scoped, search the whole workspace.
-- If the user refers to a project, board or sprint by name and you do not know its key or id, look it up first with list_projects, list_boards or list_sprints.
-- For listing, filtering or counting, write queries in {tracker.query_language}. {tracker.query_guide}
-- Use get_work_item only when the user asks about a specific item.
+- Do not assume a project, board or sprint. If the question is not scoped, search the whole site.
+- For listing, filtering or counting, use searchJiraIssuesUsingJql with JQL. Use project keys in JQL and quote values that contain spaces. Jira rejects JQL without any restriction, so for "everything" use created >= "2000-01-01".
+- Work item types: when the user asks for tasks, stories, bugs, epics or subtasks, filter by type, for example issuetype = Task, issuetype = Story, issuetype = Bug, issuetype = Epic, issuetype in subTaskIssueTypes(). If a type name is not valid on this site, look up the site's types with discover and use the exact name. Add ORDER BY updated DESC.
+- "All" means every matching item in every status, across all projects unless the user names one. Add a status filter only when the user asks (for example open means statusCategory != Done).
+- searchJiraIssuesUsingJql in this app already follows every page and returns the matching items as compact rows (key, summary, type, status, priority, assignee, updated). Do not page it yourself. Show every row it returns in one Markdown table and state the total (returned). If complete is false, repeat its note.
+- Some tools are not listed directly. Call discover with a short description of what you need (for example "list boards", "list sprints of a board", "fields required to create a work item"), then run the tool it returns with executeRead for reads, or executeWrite / executeDestructive for changes, exactly as discover describes.
 - If a tool returns an error, adjust the query or the approach and try again; explain the problem if you cannot resolve it.
-- Answer in clear Markdown. Use bullet points or a table for lists (key, summary, status, priority). State totals, and mention when results were capped.
+- Answer in clear Markdown. Use a table for lists of work items. State totals, and mention when results were capped.
 
 Asking the user (ask_user):
 - Ask only when information is missing and no tool can find it. Ask ONE question per turn, then wait for the answer.
-- If the user does not name a project and list_projects returns more than one, ask which project (choice, options are "Name (KEY)").
+- If the user does not name a project and there is more than one, ask which project (choice, options are "Name (KEY)").
 - Ask a question only when the user's request needs it. Do not ask about optional fields unless the user wants to set them.
-
-Creating a work item:
-1. Make sure you know the project key (list_projects, then ask if several) and the issue type (list_issue_types, then ask if several).
-2. Call get_required_fields. Ask about each required field that the user has not already given, one question at a time, using input_type choice with allowed_values as options when they exist. For a user field, ask for a name or email, call search_users, then ask the user to choose from the results.
-3. Before creating, ask one confirmation question (choice Yes/No) that summarises the values.
-4. Only if the user confirms, call create_work_item with field_id/value pairs. Report the new key and link. If it fails, explain the error and ask for the field that needs correcting.
 - An answer of null in a tool result means the user skipped that question.
+
+Changing Jira (creating, editing, transitioning, commenting, or any other change):
+- The app shows every change to the user with its exact values and runs it only after the user approves it. Do not ask a separate yes/no confirmation; make the change call once you have every value.
+- If a result says the user rejected the change, it was not made. Say so, and do not retry unless the user asks again.
+- To create a work item: find the project key and the work item type, then look up the fields that type requires. Ask about each required field the user has not given, one question at a time, using choice when allowed values exist. For a user field, look up the account ID by name or email and let the user choose. Then create it and report the new key and link.
 """
 
 
@@ -336,94 +235,15 @@ def _to_messages(history: List[ChatTurn]) -> List[Message]:
     return messages
 
 
-async def _cached(key: Tuple[str, str, str], fetch: Callable[[], Awaitable[Any]]) -> Any:
-    now = time.monotonic()
-    hit = _metadata_cache.get(key)
-    if hit and now - hit[0] < METADATA_TTL_SECONDS:
-        return hit[1]
-    value = await fetch()
-    _metadata_cache[key] = (now, value)
-    return value
-
-
-def _build_handlers(tracker: IssueTracker, session_id: str) -> Dict[str, Callable[[Dict[str, Any]], Awaitable[Any]]]:
-    def required(args: Dict[str, Any], key: str) -> str:
-        value = args.get(key)
-        if value in (None, ""):
-            raise ValueError(f"Missing required argument '{key}'.")
-        return str(value)
-
-    def cache_key(tool: str, args: Dict[str, Any] | None = None) -> Tuple[str, str, str]:
-        return (session_id, tool, json.dumps(args or {}, sort_keys=True))
-
-    async def search(args: Dict[str, Any]) -> Any:
-        max_results = int(args.get("max_results") or 50)
-        return await tracker.search_work_items(query=required(args, "query"), max_results=max_results)
-
-    async def count(args: Dict[str, Any]) -> Any:
-        return {"count": await tracker.count_work_items(query=required(args, "query"))}
-
-    async def list_boards(args: Dict[str, Any]) -> Any:
-        project_key = args.get("project_key") or None
-        return await _cached(
-            cache_key("list_boards", {"project_key": project_key}),
-            lambda: tracker.list_boards(project_key=project_key),
-        )
-
-    async def list_sprints(args: Dict[str, Any]) -> Any:
-        return await tracker.list_sprints(board_id=required(args, "board_id"), state=args.get("state") or None)
-
-    async def get_item(args: Dict[str, Any]) -> Any:
-        return await tracker.get_work_item(item_id=required(args, "item_id"))
-
-    async def projects(_: Dict[str, Any]) -> Any:
-        return await _cached(cache_key("list_projects"), tracker.list_projects)
-
-    async def issue_types(args: Dict[str, Any]) -> Any:
-        return await tracker.list_issue_types(project_key=required(args, "project_key"))
-
-    async def required_fields(args: Dict[str, Any]) -> Any:
-        return await tracker.get_required_fields(
-            project_key=required(args, "project_key"), issue_type=required(args, "issue_type")
-        )
-
-    async def users(args: Dict[str, Any]) -> Any:
-        return await tracker.search_users(query=required(args, "query"))
-
-    async def create(args: Dict[str, Any]) -> Any:
-        values = {
-            str(item["field_id"]): item.get("value")
-            for item in args.get("values") or []
-            if isinstance(item, dict) and item.get("field_id")
-        }
-        return await tracker.create_work_item(
-            project_key=required(args, "project_key"), issue_type=required(args, "issue_type"), values=values
-        )
-
-    return {
-        "list_projects": projects,
-        "list_boards": list_boards,
-        "list_sprints": list_sprints,
-        "search_work_items": search,
-        "count_work_items": count,
-        "get_work_item": get_item,
-        "list_issue_types": issue_types,
-        "get_required_fields": required_fields,
-        "search_users": users,
-        "create_work_item": create,
-    }
-
-
-def _tool_content(result: Any) -> str:
+def _tool_content(result: Any, name: str = "") -> str:
     text = json.dumps(result, default=str, ensure_ascii=False)
-    if len(text) > MAX_TOOL_RESULT_CHARS:
-        text = text[:MAX_TOOL_RESULT_CHARS] + " ...[truncated]"
+    limit = MAX_LIST_RESULT_CHARS if name == atlassian_mcp.SEARCH_TOOL else MAX_TOOL_RESULT_CHARS
+    if len(text) > limit:
+        text = text[:limit] + " ...[truncated]"
     return text
 
 
-async def _run_tool(
-    handlers: Dict[str, Callable[[Dict[str, Any]], Awaitable[Any]]], call: ToolCall
-) -> Tuple[ToolCall, Any, str]:
+async def _run_tool(handlers: Dict[str, Handler], call: ToolCall) -> Tuple[ToolCall, Any, str]:
     handler = handlers.get(call.name)
     try:
         if handler is None:
@@ -441,29 +261,67 @@ def _llm_details(resp: LLMResponse) -> str:
     return f"{resp.elapsed_ms} ms{tokens}"
 
 
-def _context(session_id: str):
-    tracker = get_active_tracker(session_id)
+def _jira_handler(session_id: str, tool: Any) -> Handler:
+    if tool.name == atlassian_mcp.SEARCH_TOOL:
+        async def search(args: Dict[str, Any]) -> Any:
+            return await atlassian_mcp.search_all_issues(session_id, tool, args)
+
+        return search
+
+    async def handle(args: Dict[str, Any]) -> Any:
+        return await atlassian_mcp.call_tool(session_id, tool, args)
+
+    return handle
+
+
+async def _context(session_id: str) -> _RunContext:
     connection = get_github_connection(session_id)
     github = (connection.login, sorted(connection.selected)) if connection and connection.selected else None
+    status = get_atlassian_status(session_id)
 
-    handlers: Dict[str, Callable[[Dict[str, Any]], Awaitable[Any]]] = {}
+    handlers: Dict[str, Handler] = {}
     tools: List[ToolSpec] = []
-    if tracker:
-        handlers.update(_build_handlers(tracker, session_id))
-        tools.extend(TOOL_SPECS)
+    approval_required: Set[str] = set()
+    jira: Optional[Tuple[AtlassianStatus, str]] = None
+    if status.connected:
+        load_error = ""
+        try:
+            if not status.cloud_id:
+                await atlassian_mcp.load_workspace(session_id)
+            mcp_tools = await atlassian_mcp.list_tools(session_id)
+        except (atlassian_mcp.AtlassianMCPError, AtlassianAuthError) as e:
+            mcp_tools, load_error = [], str(e)
+        for tool in mcp_tools:
+            if tool.name == ASK_TOOL:
+                continue
+            handlers[tool.name] = _jira_handler(session_id, tool)
+            tools.append(atlassian_mcp.tool_spec(tool))
+            if atlassian_mcp.requires_approval(tool):
+                approval_required.add(tool.name)
+        jira = (get_atlassian_status(session_id), load_error)
     if github:
-        handlers.update(build_github_handlers(session_id))
-        if not tracker:
-            tools.append(ASK_TOOL_SPEC)
+        github_handlers = build_github_handlers(session_id)
+        # The app's own GitHub tools win over a server tool with the same name.
+        tools = [spec for spec in tools if spec.name not in github_handlers]
+        approval_required -= set(github_handlers)
+        handlers.update(github_handlers)
         tools.extend(GITHUB_TOOL_SPECS)
+    if handlers:
+        tools.append(ASK_TOOL_SPEC)
 
-    if tracker:
-        provider_name = tracker.name
+    if jira:
+        provider_name = "Jira"
     elif github:
         provider_name = "GitHub"
     else:
         provider_name = "general"
-    return tracker, handlers, tools, provider_name, _build_system_prompt(tracker, github)
+    return _RunContext(
+        handlers=handlers,
+        tools=tools,
+        approval_required=approval_required,
+        provider_name=provider_name,
+        system_prompt=_build_system_prompt(jira, github),
+    )
 
 
 def _ask_event(call: ToolCall, pending_id: str) -> Dict[str, Any]:
@@ -488,28 +346,63 @@ def _ask_event(call: ToolCall, pending_id: str) -> Dict[str, Any]:
     }
 
 
+def _approval_event(call: ToolCall, pending_id: str, provider_name: str) -> Dict[str, Any]:
+    """The approval question for one change. The values come from the stored call, not from the model's wording."""
+    return {
+        "type": "ask",
+        "pending_id": pending_id,
+        "question": f"Approve this {provider_name} change?",
+        "details": f"The assistant wants to run **{call.name}** with the values below. Nothing has been changed yet.",
+        "code": json.dumps(call.args or {}, indent=2, ensure_ascii=False),
+        "code_language": "json",
+        "input_type": "choice",
+        "options": [APPROVE, REJECT],
+        "allow_other": False,
+        "required": True,
+    }
+
+
 def _prune_pending_asks() -> None:
     now = time.monotonic()
     for pending_id in [k for k, v in _pending_asks.items() if now - v.created > PENDING_ASK_TTL_SECONDS]:
         del _pending_asks[pending_id]
 
 
+def _pause_for_approval(
+    session_id: str, messages: List[Message], trace: List[AgentStepTrace], queue: List[ToolCall], provider_name: str
+) -> Dict[str, Any]:
+    _prune_pending_asks()
+    pending_id = uuid.uuid4().hex
+    _pending_asks[pending_id] = _PendingAsk(
+        session_id=session_id,
+        messages=messages,
+        trace=trace,
+        call_id=queue[0].id,
+        created=time.monotonic(),
+        approvals=list(queue),
+    )
+    trace.append(
+        AgentStepTrace(
+            step_name=f"{provider_name}: approval requested",
+            tool_used=queue[0].name,
+            status="WAITING",
+            details=_tool_content(queue[0].args)[:500],
+        )
+    )
+    return _approval_event(queue[0], pending_id, provider_name)
+
+
 async def _run_loop(
-    session_id: str,
-    provider_name: str,
-    system_prompt: str,
-    tools: List[ToolSpec],
-    handlers: Dict[str, Callable[[Dict[str, Any]], Awaitable[Any]]],
-    messages: List[Message],
-    trace: List[AgentStepTrace],
+    session_id: str, ctx: _RunContext, messages: List[Message], trace: List[AgentStepTrace]
 ) -> AsyncIterator[Dict[str, Any]]:
     chain = get_llm_chain()
+    provider_name = ctx.provider_name
 
     for _ in range(MAX_TOOL_ROUNDS):
         resp: Optional[LLMResponse] = None
         emitted_text = False
         try:
-            async for item in chain.stream(system_prompt, messages, tools):
+            async for item in chain.stream(ctx.system_prompt, messages, ctx.tools):
                 if isinstance(item, LLMResponse):
                     resp = item
                 else:
@@ -548,12 +441,15 @@ async def _run_loop(
             yield {"type": "reset"}
 
         ask_calls = [call for call in resp.tool_calls if call.name == ASK_TOOL]
-        work_calls = [call for call in resp.tool_calls if call.name != ASK_TOOL]
+        gated_calls = [call for call in resp.tool_calls if call.name in ctx.approval_required]
+        work_calls = [
+            call for call in resp.tool_calls if call.name != ASK_TOOL and call.name not in ctx.approval_required
+        ]
 
         if work_calls:
             yield {"type": "status", "message": f"Querying {provider_name}..."}
             # Independent tool calls from one model turn run concurrently.
-            outcomes = await asyncio.gather(*(_run_tool(handlers, call) for call in work_calls))
+            outcomes = await asyncio.gather(*(_run_tool(ctx.handlers, call) for call in work_calls))
             for call, result, status in outcomes:
                 trace.append(
                     AgentStepTrace(
@@ -563,8 +459,10 @@ async def _run_loop(
                         details=_tool_content(result)[:500],
                     )
                 )
-                messages.append(ToolResultMessage(call_id=call.id, name=call.name, content=_tool_content(result)))
-            if all(status == "FAILED" for _, _, status in outcomes):
+                messages.append(
+                    ToolResultMessage(call_id=call.id, name=call.name, content=_tool_content(result, call.name))
+                )
+            if not gated_calls and all(status == "FAILED" for _, _, status in outcomes):
                 # Retrying the same failing call only burns the tool-call budget, so report the error now.
                 errors = " | ".join(str(result.get("error", result)) for _, result, _ in outcomes)
                 yield {
@@ -574,6 +472,19 @@ async def _run_loop(
                     "execution_trace": trace,
                 }
                 return
+
+        if gated_calls:
+            # Changes never run here: the run pauses and resume_answer runs each one only after the user approves it.
+            for extra in ask_calls:
+                messages.append(
+                    ToolResultMessage(
+                        call_id=extra.id,
+                        name=ASK_TOOL,
+                        content=json.dumps({"status": "not asked, the user is reviewing a change first"}),
+                    )
+                )
+            yield _pause_for_approval(session_id, messages, trace, gated_calls, provider_name)
+            return
 
         if ask_calls:
             # Pause here: the answer comes back through resume_answer, which appends the tool result.
@@ -612,17 +523,20 @@ async def _run_loop(
 
 async def stream_answer(session_id: str, message: str, history: List[ChatTurn]) -> AsyncIterator[Dict[str, Any]]:
     """Run the agent and yield events: delta (answer text), reset (text was preamble before tool calls),
-    status (tool calls in progress), ask (the agent needs an answer; resume with resume_answer) and a final
-    done event with the full answer and trace."""
-    _, handlers, tools, provider_name, system_prompt = _context(session_id)
+    status (tool calls in progress), ask (the agent needs an answer or an approval; resume with resume_answer)
+    and a final done event with the full answer and trace."""
+    ctx = await _context(session_id)
     messages = _to_messages(history)
     messages.append(UserMessage(text=message))
-    async for event in _run_loop(session_id, provider_name, system_prompt, tools, handlers, messages, []):
+    async for event in _run_loop(session_id, ctx, messages, []):
         yield event
 
 
 async def resume_answer(session_id: str, pending_id: str, answer: Any) -> AsyncIterator[Dict[str, Any]]:
-    """Continue a run paused on an ask event with the user's answer (None when the question was skipped)."""
+    """Continue a paused run with the user's answer (None when the question was skipped).
+
+    For an approval, the stored call runs only when the answer is exactly "Approve".
+    """
     _prune_pending_asks()
     pending = _pending_asks.pop(pending_id, None)
     if pending is None or pending.session_id != session_id:
@@ -634,8 +548,8 @@ async def resume_answer(session_id: str, pending_id: str, answer: Any) -> AsyncI
         }
         return
 
-    tracker, handlers, tools, provider_name, system_prompt = _context(session_id)
-    if not handlers:
+    ctx = await _context(session_id)
+    if not ctx.handlers:
         yield {
             "type": "done",
             "answer": "The workspace was disconnected before your answer was used. Connect it again and retry.",
@@ -644,20 +558,43 @@ async def resume_answer(session_id: str, pending_id: str, answer: Any) -> AsyncI
         }
         return
 
-    pending.messages.append(
-        ToolResultMessage(call_id=pending.call_id, name=ASK_TOOL, content=json.dumps({"answer": answer}, ensure_ascii=False))
-    )
-    pending.trace.append(
-        AgentStepTrace(
-            step_name="User answer",
-            tool_used=ASK_TOOL,
-            status="SUCCESS",
-            details=json.dumps(answer, ensure_ascii=False)[:500],
+    if pending.approvals:
+        call, remaining = pending.approvals[0], pending.approvals[1:]
+        if answer == APPROVE:
+            yield {"type": "status", "message": f"Running {call.name} in {ctx.provider_name}..."}
+            _, result, status = await _run_tool(ctx.handlers, call)
+        else:
+            result = {"status": "rejected", "message": "The user rejected this change, so it was not made."}
+            status = "REJECTED"
+        pending.trace.append(
+            AgentStepTrace(
+                step_name=f"{ctx.provider_name}: {call.name}",
+                tool_used=f"{call.name}({json.dumps(call.args, ensure_ascii=False)})",
+                status=status,
+                details=_tool_content(result)[:500],
+            )
         )
-    )
-    async for event in _run_loop(
-        session_id, provider_name, system_prompt, tools, handlers, pending.messages, pending.trace
-    ):
+        pending.messages.append(
+            ToolResultMessage(call_id=call.id, name=call.name, content=_tool_content(result, call.name))
+        )
+        if remaining:
+            yield _pause_for_approval(session_id, pending.messages, pending.trace, remaining, ctx.provider_name)
+            return
+    else:
+        pending.messages.append(
+            ToolResultMessage(
+                call_id=pending.call_id, name=ASK_TOOL, content=json.dumps({"answer": answer}, ensure_ascii=False)
+            )
+        )
+        pending.trace.append(
+            AgentStepTrace(
+                step_name="User answer",
+                tool_used=ASK_TOOL,
+                status="SUCCESS",
+                details=json.dumps(answer, ensure_ascii=False)[:500],
+            )
+        )
+    async for event in _run_loop(session_id, ctx, pending.messages, pending.trace):
         yield event
 
 
